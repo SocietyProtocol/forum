@@ -23,7 +23,7 @@ def main() -> int:
         raise SystemExit(f"missing placeholders: {missing}")
     if "REPLACE_WITH_SMTP_HOST" not in example:
         raise SystemExit("SMTP host is not a placeholder")
-    if "bitnami/discourse:" not in dockerfile:
+    if "bitnamilegacy/discourse:" not in dockerfile and "bitnami/discourse:" not in dockerfile:
         raise SystemExit("Dockerfile does not use the Discourse image")
     if "forum.societyprotocol.io stays" not in dockerfile and "stays on the current host" not in dockerfile:
         raise SystemExit("Dockerfile is missing the production-safe comment")
