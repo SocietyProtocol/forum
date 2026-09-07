@@ -3,7 +3,10 @@
 FROM discourse/discourse:2026.8.0-latest.1
 
 USER root
-RUN gem install rubyzip --no-document \
+# The prebuilt image ships both discourse-calendar and discourse-events.
+# Together they crash boot with MultiplePrependBlocks. Keep calendar.
+RUN rm -rf /var/www/discourse/plugins/discourse-events \
+  && gem install rubyzip --no-document \
   && git clone --depth 1 --branch railway-migration \
     https://github.com/SocietyProtocol/discourse-siwe-auth.git \
     /var/www/discourse/plugins/discourse-siwe-auth \
