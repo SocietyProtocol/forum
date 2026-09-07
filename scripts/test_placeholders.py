@@ -29,6 +29,8 @@ def main() -> int:
         raise SystemExit("Dockerfile does not install the SIWE plugin")
     if "disable-events.sh" not in dockerfile:
         raise SystemExit("Dockerfile does not disable the conflicting events plugin")
+    if "fix-nginx.sh" not in dockerfile:
+        raise SystemExit("Dockerfile does not listen on Railway port 8080")
     if "forum.societyprotocol.io stays" not in dockerfile and "stays on the current host" not in dockerfile:
         raise SystemExit("Dockerfile is missing the production-safe comment")
     print("ok")
