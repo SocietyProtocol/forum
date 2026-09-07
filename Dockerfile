@@ -5,7 +5,9 @@ FROM discourse/discourse:2026.8.0-latest.1
 USER root
 # The prebuilt image ships both discourse-calendar and discourse-events.
 # Together they crash boot with MultiplePrependBlocks. Keep calendar.
-RUN rm -rf /var/www/discourse/plugins/discourse-events \
+COPY disable-events.sh /etc/runit/1.d/00-disable-events
+RUN chmod +x /etc/runit/1.d/00-disable-events \
+  && rm -rf /var/www/discourse/plugins/discourse-events \
   && gem install rubyzip --no-document \
   && git clone --depth 1 --branch railway-migration \
     https://github.com/SocietyProtocol/discourse-siwe-auth.git \
