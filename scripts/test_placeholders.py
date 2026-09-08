@@ -35,6 +35,13 @@ def main() -> int:
         raise SystemExit("Dockerfile does not compile SIWE client assets")
     if "PRECOMPILE_ON_BOOT=0" not in dockerfile:
         raise SystemExit("Dockerfile still lets boot skip Ember compile")
+    if "persist-uploads.sh" not in dockerfile:
+        raise SystemExit("Dockerfile does not keep uploads on the volume")
+    if "seed-uploads" not in dockerfile:
+        raise SystemExit("Dockerfile does not seed restored uploads")
+    logo = ROOT / "seed-uploads/default/original/1X/8125148fe00ab5c849944c6b650d62754c2a3c33.png"
+    if not logo.is_file():
+        raise SystemExit("seed uploads are missing the site logo")
     if "forum.societyprotocol.io stays" not in dockerfile and "stays on the current host" not in dockerfile:
         raise SystemExit("Dockerfile is missing the production-safe comment")
     print("ok")

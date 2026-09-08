@@ -5,9 +5,11 @@ FROM discourse/discourse:2026.8.0-latest.1
 USER root
 # The prebuilt image ships both discourse-calendar and discourse-events.
 # Together they crash boot with MultiplePrependBlocks. Keep calendar.
-COPY disable-events.sh /etc/runit/1.d/00-disable-events
-COPY fix-nginx.sh /etc/runit/1.d/01-fix-nginx
-RUN chmod +x /etc/runit/1.d/00-disable-events /etc/runit/1.d/01-fix-nginx \
+COPY persist-uploads.sh /etc/runit/1.d/00-persist-uploads
+COPY disable-events.sh /etc/runit/1.d/01-disable-events
+COPY fix-nginx.sh /etc/runit/1.d/02-fix-nginx
+COPY seed-uploads /opt/discourse-seed-uploads
+RUN chmod +x /etc/runit/1.d/00-persist-uploads /etc/runit/1.d/01-disable-events /etc/runit/1.d/02-fix-nginx \
   && rm -rf /var/www/discourse/plugins/discourse-events \
   && gem install rubyzip --no-document \
   && git clone --depth 1 --branch railway-migration \
