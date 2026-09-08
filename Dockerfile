@@ -13,8 +13,19 @@ RUN chmod +x /etc/runit/1.d/00-disable-events /etc/runit/1.d/01-fix-nginx \
   && git clone --depth 1 --branch railway-migration \
     https://github.com/SocietyProtocol/discourse-siwe-auth.git \
     /var/www/discourse/plugins/discourse-siwe-auth \
-  && chown -R discourse:discourse /var/www/discourse/plugins/discourse-siwe-auth
+  && chown -R discourse:discourse /var/www/discourse/plugins/discourse-siwe-auth \
+  && mkdir -p /var/www/discourse/public/plugins/discourse-siwe-auth/javascripts \
+  && cp /var/www/discourse/plugins/discourse-siwe-auth/public/javascripts/siwe.iife.js \
+    /var/www/discourse/public/plugins/discourse-siwe-auth/javascripts/siwe.iife.js \
+  && chown -R discourse:discourse /var/www/discourse/public/plugins/discourse-siwe-auth
 
+# Boot precompile uses SKIP_EMBER_CLI_COMPILE=1, so SIWE Ember JS never
+# lands in /assets. Compile it here, then skip the boot CSS-only pass.
+WORKDIR /var/www/discourse
+USER discourse
+RUN SKIP_DB_AND_REDIS=1 LOAD_PLUGINS=1 bundle exec rake assets:precompile
+USER root
+ENV PRECOMPILE_ON_BOOT=0
 ENV DISABLE_LETSENCRYPT=1
 ENV UNICORN_WORKERS=2
 ENV PORT=8080

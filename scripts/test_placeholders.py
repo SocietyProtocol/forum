@@ -31,6 +31,10 @@ def main() -> int:
         raise SystemExit("Dockerfile does not disable the conflicting events plugin")
     if "fix-nginx.sh" not in dockerfile:
         raise SystemExit("Dockerfile does not listen on Railway port 8080")
+    if "assets:precompile" not in dockerfile:
+        raise SystemExit("Dockerfile does not compile SIWE client assets")
+    if "PRECOMPILE_ON_BOOT=0" not in dockerfile:
+        raise SystemExit("Dockerfile still lets boot skip Ember compile")
     if "forum.societyprotocol.io stays" not in dockerfile and "stays on the current host" not in dockerfile:
         raise SystemExit("Dockerfile is missing the production-safe comment")
     print("ok")
