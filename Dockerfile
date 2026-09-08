@@ -15,6 +15,7 @@ RUN chmod +x /etc/runit/1.d/00-persist-uploads /etc/runit/1.d/01-disable-events 
   && git clone --depth 1 --branch railway-migration \
     https://github.com/SocietyProtocol/discourse-siwe-auth.git \
     /var/www/discourse/plugins/discourse-siwe-auth \
+  && git -C /var/www/discourse/plugins/discourse-siwe-auth rev-parse HEAD \
   && chown -R discourse:discourse /var/www/discourse/plugins/discourse-siwe-auth \
   && mkdir -p /var/www/discourse/public/plugins/discourse-siwe-auth/javascripts \
   && cp /var/www/discourse/plugins/discourse-siwe-auth/public/javascripts/siwe.iife.js \
