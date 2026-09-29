@@ -9,10 +9,11 @@ COPY persist-uploads.sh /etc/runit/1.d/00-persist-uploads
 COPY disable-events.sh /etc/runit/1.d/01-disable-events
 COPY fix-nginx.sh /etc/runit/1.d/02-fix-nginx
 COPY seed-uploads /opt/discourse-seed-uploads
+ARG SIWE_BRANCH=main
 RUN chmod +x /etc/runit/1.d/00-persist-uploads /etc/runit/1.d/01-disable-events /etc/runit/1.d/02-fix-nginx \
   && rm -rf /var/www/discourse/plugins/discourse-events \
   && gem install rubyzip --no-document \
-  && git clone --depth 1 --branch main \
+  && git clone --depth 1 --branch ${SIWE_BRANCH} \
     https://github.com/SocietyProtocol/discourse-siwe-auth.git \
     /var/www/discourse/plugins/discourse-siwe-auth \
   && git -C /var/www/discourse/plugins/discourse-siwe-auth rev-parse HEAD \
