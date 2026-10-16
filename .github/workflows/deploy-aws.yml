@@ -1,0 +1,29 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main, staging]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: aws-outpost-forum
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::019141478782:role/society-github-deploy
+          aws-region: us-east-1
+      - name: Deploy the forum
+        env:
+          IMAGE: ${{ github.ref_name == 'staging' && 'society-forum:staging' || 'society-forum:prod' }}
+          SERVICE: ${{ github.ref_name == 'staging' && 'staging-forum' || 'prod-forum' }}
+          BUILD_ARGS: ${{ github.ref_name == 'staging' && '--build-arg SIWE_BRANCH=staging' || '' }}
+        run: bash .github/scripts/deploy-outpost.sh

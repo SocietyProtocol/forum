@@ -1,5 +1,4 @@
-# Match production forum.societyprotocol.io (Discourse 2026.8.0-latest.1).
-# Production DNS stays on the current host until we move it.
+# Discourse 2026.8.0-latest.1 for forum.societyprotocol.io.
 FROM discourse/discourse:2026.8.0-latest.1
 
 USER root
