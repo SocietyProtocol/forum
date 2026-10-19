@@ -1,13 +1,6 @@
 #!/bin/bash
-# Keep Discourse uploads on the Railway volume across image deploys.
-VOL="${RAILWAY_VOLUME_MOUNT_PATH:-}"
-if [ -z "$VOL" ]; then
-  if [ -d /bitnami/discourse ]; then
-    VOL=/bitnami/discourse
-  else
-    VOL=/shared
-  fi
-fi
+# Keep Discourse uploads on the persistent volume across image deploys.
+VOL="${FORUM_VOLUME_PATH:-/shared}"
 mkdir -p "$VOL/uploads" "$VOL/backups/default"
 if [ -d /opt/discourse-seed-uploads ]; then
   cp -an /opt/discourse-seed-uploads/. "$VOL/uploads/" || true

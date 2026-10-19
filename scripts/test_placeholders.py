@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check forum env placeholders and Dockerfile ship the Railway path."""
+"""Check forum env placeholders and Dockerfile ship the upload path."""
 
 from pathlib import Path
 
@@ -30,7 +30,7 @@ def main() -> int:
     if "disable-events.sh" not in dockerfile:
         raise SystemExit("Dockerfile does not disable the conflicting events plugin")
     if "fix-nginx.sh" not in dockerfile:
-        raise SystemExit("Dockerfile does not listen on Railway port 8080")
+        raise SystemExit("Dockerfile does not listen on port 8080")
     if "assets:precompile" not in dockerfile:
         raise SystemExit("Dockerfile does not compile SIWE client assets")
     if "PRECOMPILE_ON_BOOT=0" not in dockerfile:
