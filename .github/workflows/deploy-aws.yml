@@ -100,6 +100,8 @@ jobs:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
       - name: Placeholder and Dockerfile checks
         run: python3 scripts/test_placeholders.py
+      - name: Deploy pipeline tests (stubbed docker, aws and flock)
+        run: python3 scripts/test_deploy_pipeline.py
       - name: Shell syntax
         run: |
           bash -n .github/scripts/deploy-outpost.sh
@@ -121,8 +123,11 @@ jobs:
     needs: [prepare, test]
     if: needs.prepare.outputs.target == 'staging'
     runs-on: ubuntu-latest
+    # One group for every forum deploy: staging and prod run on the same box, share
+    # its docker daemon and CPU/RAM, so they must queue, not overlap. A queued run
+    # that is replaced by a newer queued run shows as "Canceled"; re-run it.
     concurrency:
-      group: aws-outpost-forum-staging
+      group: aws-outpost-forum
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
@@ -161,8 +166,11 @@ jobs:
     environment:
       name: production
       url: https://forum.societyprotocol.io
+    # One group for every forum deploy: staging and prod run on the same box, share
+    # its docker daemon and CPU/RAM, so they must queue, not overlap. A queued run
+    # that is replaced by a newer queued run shows as "Canceled"; re-run it.
     concurrency:
-      group: aws-outpost-forum-prod
+      group: aws-outpost-forum
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4

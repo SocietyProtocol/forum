@@ -48,6 +48,18 @@ and Security categories on meta.discourse.org and the security advisories of
    the plugin SHA.
 8. **Smoke prod** (section 8, read-only checks only).
 
+Deploys queue, they never overlap. Staging and prod run on the same box, so
+both deploy jobs share one GitHub concurrency group (`aws-outpost-forum`): a
+staging push that arrives while a prod deploy runs waits for it, and the other
+way round. GitHub keeps only one waiting run per group, so a newer waiting run
+replaces an older waiting one (the older shows as "Canceled"; re-run it, which
+matters most for a waiting prod rollback). A second guard runs on the box: the
+remote script takes an exclusive `flock` on `/tmp/society-build.lock` for the whole
+build, recreate and health wait (waits up to 30 minutes, then fails without touching
+docker) and works in its own `mktemp -d` directory, so even a manual overlap cannot
+delete another run's build context. The web client and subgraph deploy scripts
+are copies of this one and must use the same lock file to be covered.
+
 Downtime: `--force-recreate` stops the single container; expect a few minutes
 of unavailability while Discourse boots. The build also runs on the live
 instance (`docker build --network=host` over SSM) and competes with the running

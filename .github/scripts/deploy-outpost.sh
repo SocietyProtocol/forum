@@ -30,6 +30,12 @@
 #   DEPLOY_SHA                          commit being deployed (default GITHUB_SHA); set it
 #                                       when the workflow checks out a ref other than
 #                                       the event commit (workflow/repository dispatch)
+#   LOCK_FILE                           host-wide lock taken on the box for the whole
+#                                       remote deploy (default /tmp/society-build.lock).
+#                                       Every outpost deploy script on the box should
+#                                       use the same file so builds never overlap.
+#   LOCK_TIMEOUT_SECONDS                how long to wait for that lock (default 1800)
+#   COMPOSE_DIR                         directory holding apps.yml (default /opt/society)
 #   DRY_RUN=1                           resolve, print the remote script, stop (no AWS)
 set -euo pipefail
 
@@ -57,12 +63,16 @@ HEALTH_PLUGIN_DIR="${HEALTH_PLUGIN_DIR:-}"
 EXPECT_PLUGIN_VERSION="${EXPECT_PLUGIN_VERSION:-}"
 POST_DEPLOY_CMD="${POST_DEPLOY_CMD:-}"
 KEEP_IMAGES="${KEEP_IMAGES:-5}"
+LOCK_FILE="${LOCK_FILE:-/tmp/society-build.lock}"
+LOCK_TIMEOUT_SECONDS="${LOCK_TIMEOUT_SECONDS:-1800}"
+COMPOSE_DIR="${COMPOSE_DIR:-/opt/society}"
+REMOTE_TMP="${REMOTE_TMP:-/tmp}"
 DRY_RUN="${DRY_RUN:-}"
 DEPLOY_SHA="${DEPLOY_SHA:-$GITHUB_SHA}"
 
 case "$IMAGE" in *:*) ;; *) IMAGE="${IMAGE}:latest" ;; esac
-case "$HEALTH_TIMEOUT_SECONDS$HEALTH_PORT$KEEP_IMAGES" in
-  *[!0-9]*) echo "HEALTH_TIMEOUT_SECONDS, HEALTH_PORT and KEEP_IMAGES must be integers" >&2; exit 2 ;;
+case "$HEALTH_TIMEOUT_SECONDS$HEALTH_PORT$KEEP_IMAGES$LOCK_TIMEOUT_SECONDS" in
+  *[!0-9]*) echo "HEALTH_TIMEOUT_SECONDS, HEALTH_PORT, KEEP_IMAGES and LOCK_TIMEOUT_SECONDS must be integers" >&2; exit 2 ;;
 esac
 
 mask_url() { sed -E 's#//[^/@ ]*@#//***@#g'; }
@@ -85,7 +95,10 @@ fi
 SHA_TAG="${IMAGE}-${DEPLOY_SHA:0:12}${PIN_TAG_SUFFIX}"
 
 REPO="${GITHUB_REPOSITORY##*/}"
-PREFIX="deploy/${REPO}/${DEPLOY_SHA}-${SERVICE}"
+# The run id keeps two runs of the same commit and service (a manual re-run
+# overlapping the original) from overwriting each other's S3 objects.
+RUN_TAG="$(printf '%s' "${GITHUB_RUN_ID:-local$$}-${GITHUB_RUN_ATTEMPT:-1}" | tr -c 'A-Za-z0-9\n' '-')"
+PREFIX="deploy/${REPO}/${DEPLOY_SHA}-${SERVICE}-${RUN_TAG}"
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
@@ -96,11 +109,27 @@ trap 'rm -rf "$WORKDIR"' EXIT
   for var in BUCKET PREFIX ENVFILE BUILD_ARGS IMAGE SHA_TAG SERVICE PIN_SHA \
     HEALTH_URL_PATH HEALTH_CONTAINER HEALTH_PORT HEALTH_EXPECT_BODY \
     HEALTH_TIMEOUT_SECONDS HEALTH_PLUGIN_DIR EXPECT_PLUGIN_VERSION \
-    POST_DEPLOY_CMD KEEP_IMAGES; do
+    POST_DEPLOY_CMD KEEP_IMAGES LOCK_FILE LOCK_TIMEOUT_SECONDS COMPOSE_DIR REMOTE_TMP; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
   cat <<'REMOTE'
 set -eu
+
+# Host-wide lock for the whole deploy. Staging and prod (and the other outpost
+# services) share one box, one docker daemon and its CPU/RAM, so two deploys must
+# never build or recreate at the same time. The lock is released when this
+# script exits (fd 9 closes).
+command -v flock >/dev/null 2>&1 || { echo "flock is required on the box (util-linux)" >&2; exit 1; }
+exec 9>"${LOCK_FILE}"
+echo "waiting up to ${LOCK_TIMEOUT_SECONDS}s for the deploy lock ${LOCK_FILE}"
+flock -w "${LOCK_TIMEOUT_SECONDS}" 9 || { echo "DEPLOY_FAILED ${SERVICE}: another deploy held ${LOCK_FILE} for ${LOCK_TIMEOUT_SECONDS}s" >&2; exit 1; }
+echo "deploy lock acquired"
+
+# Private working directory per run. Leftovers of killed runs are removed under the lock.
+find "${REMOTE_TMP}" -maxdepth 1 -name 'society-build.*' -mmin +1440 -exec rm -rf {} + 2>/dev/null || true
+RUN_DIR="$(mktemp -d "${REMOTE_TMP}/society-build.XXXXXX")"
+trap 'rm -rf "$RUN_DIR"' EXIT
+SRC_DIR="${RUN_DIR}/src"
 
 log_tail() { # last 50 container log lines with obvious credentials masked
   docker logs --tail 50 "$1" 2>&1 | tail -n 50 \
@@ -114,12 +143,11 @@ fail_with_logs() {
   exit 1
 }
 
-rm -rf /tmp/society-src
-mkdir -p /tmp/society-src
-aws s3 cp "s3://${BUCKET}/${PREFIX}.tgz" /tmp/society-src.tgz
-tar -xzf /tmp/society-src.tgz -C /tmp/society-src
+mkdir -p "${SRC_DIR}"
+aws s3 cp "s3://${BUCKET}/${PREFIX}.tgz" "${RUN_DIR}/src.tgz"
+tar -xzf "${RUN_DIR}/src.tgz" -C "${SRC_DIR}"
 if [ -n "${ENVFILE}" ]; then
-  cp "${ENVFILE}" /tmp/society-src/.env.production
+  cp "${ENVFILE}" "${SRC_DIR}/.env.production"
 fi
 
 # Keep a rollback image: the current tag is about to be overwritten by the build.
@@ -139,8 +167,8 @@ else
 fi
 
 # shellcheck disable=SC2086
-docker build --network=host ${BUILD_ARGS} -t "${IMAGE}" -t "${SHA_TAG}" /tmp/society-src
-rm -rf /tmp/society-src /tmp/society-src.tgz
+docker build --network=host ${BUILD_ARGS} -t "${IMAGE}" -t "${SHA_TAG}" "${SRC_DIR}"
+rm -rf "${RUN_DIR}/src" "${RUN_DIR}/src.tgz"
 
 # Drop old SHA tags beyond KEEP_IMAGES (newest first). Untagging never removes an
 # image another tag (including -prev) or a running container still uses.
@@ -150,7 +178,7 @@ docker image ls "${repo_part}" --format '{{.Tag}}' \
   | awk -v keep="${KEEP_IMAGES}" 'NR > keep' \
   | while read -r old; do docker rmi "${repo_part}:${old}" >/dev/null 2>&1 || true; done || true
 
-cd /opt/society
+cd "${COMPOSE_DIR}"
 docker compose -f apps.yml up -d --no-deps --force-recreate "${SERVICE}"
 
 if [ -n "${POST_DEPLOY_CMD}" ]; then
@@ -219,7 +247,12 @@ PARAMS="$WORKDIR/params.json"
 python3 - "$BUCKET" "$PREFIX" "$WORKDIR/params.json" <<'PY'
 import json, sys
 bucket, prefix, path = sys.argv[1:]
-cmd = f"aws s3 cp s3://{bucket}/{prefix}.sh /tmp/society-deploy.sh && bash /tmp/society-deploy.sh && rm -f /tmp/society-deploy.sh"
+# A private directory per run: a fixed /tmp path would let two overlapping runs
+# overwrite the script one of them is still reading.
+cmd = (
+    "set -e; d=$(mktemp -d /tmp/society-deploy.XXXXXX); trap 'rm -rf \"$d\"' EXIT; "
+    f"aws s3 cp s3://{bucket}/{prefix}.sh \"$d/deploy.sh\"; bash \"$d/deploy.sh\""
+)
 json.dump({"commands": [cmd]}, open(path, "w"))
 PY
 
