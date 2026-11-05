@@ -48,6 +48,7 @@ USER root
 ENV PRECOMPILE_ON_BOOT=0
 ENV DISABLE_LETSENCRYPT=1
 ENV UNICORN_WORKERS=2
+# 8080 is a Railway leftover kept until the AWS proxy port is confirmed (see fix-nginx.sh).
 ENV PORT=8080
 EXPOSE 80 8080
 
