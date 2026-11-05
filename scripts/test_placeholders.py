@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Check forum env placeholders and Dockerfile ship the upload path."""
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,8 +43,26 @@ def main() -> int:
     logo = ROOT / "seed-uploads/default/original/1X/8125148fe00ab5c849944c6b650d62754c2a3c33.png"
     if not logo.is_file():
         raise SystemExit("seed uploads are missing the site logo")
-    if "forum.societyprotocol.io stays" not in dockerfile and "stays on the current host" not in dockerfile:
-        raise SystemExit("Dockerfile is missing the production-safe comment")
+    # The Railway-era "stays on the current host" comment check is gone: it
+    # asserted wording, not behaviour, and the Dockerfile no longer carries it.
+    from_tag = re.search(r"^FROM discourse/discourse:([^@\s]+)(@sha256:[0-9a-f]{64})?\s*$", dockerfile, re.M)
+    if not from_tag:
+        raise SystemExit("Dockerfile FROM line is not a pinned discourse/discourse tag")
+    if f'io.societyprotocol.discourse.tag="{from_tag.group(1)}"' not in dockerfile:
+        raise SystemExit("Dockerfile Discourse tag label does not match the FROM tag")
+    if f'org.opencontainers.image.base.name="discourse/discourse:{from_tag.group(1)}"' not in dockerfile:
+        raise SystemExit("Dockerfile base.name label does not match the FROM tag")
+    if "ARG SIWE_REF" not in dockerfile or "ARG SIWE_BRANCH" not in dockerfile:
+        raise SystemExit("Dockerfile must declare both SIWE_REF and SIWE_BRANCH")
+    if "io.societyprotocol.siwe-auth.ref" not in dockerfile:
+        raise SystemExit("Dockerfile does not label the plugin ref")
+    for name in (".env.example", ".env.staging.example"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        for line in text.splitlines():
+            if "://" in line and "@" in line.split("://", 1)[1].split("/", 1)[0]:
+                raise SystemExit(f"{name} has a URL with embedded credentials")
+        if re.search(r"(?i)railway", text):
+            raise SystemExit(f"{name} still mentions Railway")
     print("ok")
     return 0
 
