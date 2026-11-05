@@ -21,6 +21,8 @@ HERE = Path(__file__).resolve().parent
 ROOT = Path(os.environ.get("FORUM_ROOT", HERE.parent)).resolve()
 STUBS = HERE / "stubs"
 DEPLOY = ROOT / ".github/scripts/deploy-outpost.sh"
+PREPARE = ROOT / ".github/scripts/prepare-target.sh"
+DOCKERFILE = ROOT / "Dockerfile"
 WORKFLOW = ROOT / ".github/workflows/deploy-aws.yml"
 
 SHA_A = "a" * 40
@@ -205,6 +207,208 @@ class ConcurrencyTests(BoxTestCase):
             p = self.box.deploy(use_stub_flock=False)
         self.assertNotEqual(p.returncode, 0)
         self.assertEqual([c for c in self.box.calls if c.startswith("docker ")], [])
+
+
+# Values a caller could smuggle in through workflow_dispatch / repository_dispatch.
+BAD_SHAS = {
+    "newline injection": SHA_A + "\ntarget=prod",
+    "newline then checkout_ref": SHA_A + "\ncheckout_ref=evil",
+    "trailing newline": SHA_A + "\n",
+    "leading newline": "\n" + SHA_A,
+    "only a newline": "\n",
+    "two valid lines": SHA_A + "\n" + SHA_B,
+    "short (39)": "a" * 39,
+    "long (41)": "a" * 41,
+    "uppercase": "A" * 40,
+    "mixed case": "a" * 39 + "F",
+    "non-hex letter": "a" * 39 + "g",
+    "leading space": " " + "a" * 39,
+    "trailing space": "a" * 39 + " ",
+    "shell metachar": "a" * 30 + "; rm -rf",
+    "build-arg injection": "a" * 23 + " --build-arg X=1",
+    "short sha": "abc1234",
+    "branch name": "main",
+}
+
+
+def run_prepare(tmp, **env_vars):
+    out = Path(tmp) / "gh_output"
+    out.write_text("")
+    env = {"PATH": os.environ["PATH"], "GITHUB_OUTPUT": str(out)}
+    env.update(env_vars)
+    p = subprocess.run(["bash", str(PREPARE)], env=env, capture_output=True, text=True)
+    return p, out.read_text()
+
+
+class PrepareTargetTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="preparetest.")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def parse(self, text):
+        lines = text.splitlines()
+        self.assertEqual(
+            [l.split("=", 1)[0] for l in lines],
+            ["target", "checkout_ref", "plugin_sha"],
+            "unexpected output lines: %r" % text,
+        )
+        return dict(l.split("=", 1) for l in lines)
+
+    def assertRejected(self, label, **env):
+        p, out = run_prepare(self.tmp, **env)
+        self.assertNotEqual(p.returncode, 0, "%s was accepted: %r" % (label, out))
+        self.assertEqual(out, "", "%s wrote to GITHUB_OUTPUT: %r" % (label, out))
+
+    def test_push_paths(self):
+        for branch, target in (("main", "prod"), ("staging", "staging")):
+            p, out = run_prepare(self.tmp, EVENT="push", PUSH_SHA=SHA_A, REF_NAME=branch)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(
+                self.parse(out), {"target": target, "checkout_ref": SHA_A, "plugin_sha": ""}
+            )
+
+    def test_push_on_other_branch_is_rejected(self):
+        self.assertRejected("push feature", EVENT="push", PUSH_SHA=SHA_A, REF_NAME="feature/x")
+
+    def test_workflow_dispatch_valid(self):
+        for ref, target in (("main", "prod"), ("staging", "staging")):
+            for sha in ("", SHA_B):
+                p, out = run_prepare(
+                    self.tmp, EVENT="workflow_dispatch", INPUT_REF=ref, INPUT_SHA=sha
+                )
+                self.assertEqual(p.returncode, 0, p.stderr)
+                self.assertEqual(
+                    self.parse(out), {"target": target, "checkout_ref": ref, "plugin_sha": sha}
+                )
+
+    def test_repository_dispatch_valid(self):
+        for env, ref, target in (("prod", "main", "prod"), ("staging", "staging", "staging")):
+            p, out = run_prepare(
+                self.tmp, EVENT="repository_dispatch", PAYLOAD_ENV=env, PAYLOAD_SHA=SHA_C
+            )
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(
+                self.parse(out), {"target": target, "checkout_ref": ref, "plugin_sha": SHA_C}
+            )
+
+    def test_bad_plugin_sha_is_rejected_for_workflow_dispatch(self):
+        for label, sha in BAD_SHAS.items():
+            self.assertRejected(
+                "dispatch input: " + label,
+                EVENT="workflow_dispatch", INPUT_REF="staging", INPUT_SHA=sha,
+            )
+
+    def test_bad_plugin_sha_is_rejected_for_repository_dispatch(self):
+        for label, sha in BAD_SHAS.items():
+            self.assertRejected(
+                "payload sha: " + label,
+                EVENT="repository_dispatch", PAYLOAD_ENV="staging", PAYLOAD_SHA=sha,
+            )
+
+    def test_injected_sha_cannot_flip_the_target(self):
+        # The reported attack: a staging run whose sha smuggles in "target=prod".
+        p, out = run_prepare(
+            self.tmp, EVENT="workflow_dispatch", INPUT_REF="staging",
+            INPUT_SHA=SHA_A + "\ntarget=prod",
+        )
+        self.assertNotEqual(p.returncode, 0)
+        self.assertNotIn("target=prod", out)
+
+    def test_ref_must_be_exactly_main_or_staging(self):
+        for ref in ("main\ntarget=prod", "staging\n", "MAIN", "main ", " main", "feature",
+                    "refs/heads/main", "main;id", "", "production", "prod"):
+            self.assertRejected("ref %r" % ref, EVENT="workflow_dispatch", INPUT_REF=ref)
+
+    def test_dispatch_env_must_be_exactly_staging_or_prod(self):
+        for env in ("prod\n", "staging\ntarget=prod", "production", "Prod", "main", "", " prod"):
+            self.assertRejected(
+                "payload env %r" % env, EVENT="repository_dispatch", PAYLOAD_ENV=env
+            )
+
+    def test_unknown_event_is_rejected(self):
+        self.assertRejected("schedule", EVENT="schedule")
+
+    def test_bad_push_sha_is_rejected(self):
+        self.assertRejected(
+            "push sha", EVENT="push", REF_NAME="main", PUSH_SHA=SHA_A + "\ntarget=prod"
+        )
+
+
+class DeployScriptValidationTests(unittest.TestCase):
+    def test_bad_pin_sha_is_rejected_before_anything_is_built(self):
+        for label, sha in BAD_SHAS.items():
+            rc, out, err = dry_run(base_env(PIN_SHA=sha))
+            self.assertNotEqual(rc, 0, "PIN_SHA %s was accepted" % label)
+            self.assertNotIn("DRY_RUN", out, label)
+
+    def test_valid_pin_sha_becomes_exactly_one_build_arg(self):
+        script = remote_script(base_env(PIN_SHA=SHA_B))
+        m = re.search(r"export BUILD_ARGS=(.*)", script)
+        self.assertEqual(
+            m.group(1).replace("\\", ""),
+            "--build-arg SIWE_BRANCH=main --build-arg SIWE_REF=" + SHA_B,
+        )
+
+    def test_bad_deploy_sha_is_rejected(self):
+        for label, sha in BAD_SHAS.items():
+            rc, _, _ = dry_run(base_env(GITHUB_SHA=sha, DEPLOY_SHA=sha))
+            self.assertNotEqual(rc, 0, "DEPLOY_SHA %s was accepted" % label)
+
+    def test_pin_build_arg_must_be_an_identifier(self):
+        for name in ("SIWE_REF --privileged", "SIWE_REF\nX", "1X", "A=B", "A-B"):
+            rc, _, _ = dry_run(base_env(PIN_BUILD_ARG=name))
+            self.assertNotEqual(rc, 0, name)
+
+    def test_unpinned_run_resolves_and_validates_the_branch_tip(self):
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.run(["git", "init", "-q", "-b", "main", d], check=True)
+            env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                       GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+            subprocess.run(["git", "-C", d, "commit", "-q", "--allow-empty", "-m", "x"],
+                           check=True, env=env)
+            tip = subprocess.run(["git", "-C", d, "rev-parse", "HEAD"], capture_output=True,
+                                 text=True, check=True).stdout.strip()
+            script = remote_script(base_env(PIN_SHA="", PIN_REPO_URL=d))
+            self.assertIn("SIWE_REF=" + tip, script)
+            rc, _, err = dry_run(base_env(PIN_SHA="", PIN_REPO_URL=d, PIN_BRANCH="nope"))
+            self.assertNotEqual(rc, 0, err)
+
+
+class DockerfileValidationTests(unittest.TestCase):
+    def snippet(self):
+        for line in DOCKERFILE.read_text().splitlines():
+            if "SIWE_REF" in line and "${#SIWE_REF}" in line:
+                return line.strip().rstrip("\\").strip()
+        self.fail("no SIWE_REF length check in the Dockerfile")
+
+    def run_check(self, value):
+        p = subprocess.run(
+            ["sh", "-c", self.snippet() + " echo PASSED"],
+            env={"PATH": os.environ["PATH"], "SIWE_REF": value},
+            capture_output=True, text=True,
+        )
+        return p.returncode == 0 and p.stdout.strip() == "PASSED"
+
+    def test_valid_sha_passes(self):
+        self.assertTrue(self.run_check(SHA_A))
+
+    def test_bad_values_fail(self):
+        for label, sha in BAD_SHAS.items():
+            self.assertFalse(self.run_check(sha), "SIWE_REF %s passed" % label)
+
+
+class WorkflowInputHandlingTests(unittest.TestCase):
+    def test_untrusted_expressions_only_appear_as_env_values(self):
+        # Interpolating ${{ inputs.* }} or the dispatch payload into a shell script is
+        # injectable. They may only be assigned to env vars (KEY: ${{ ... }}).
+        for n, line in enumerate(WORKFLOW.read_text().splitlines(), 1):
+            if re.search(r"\$\{\{[^}]*(inputs\.|client_payload|head_ref|github\.event\.)", line):
+                self.assertRegex(line, r"^\s+[A-Z_]+: \$\{\{ [^}]+ \}\}\s*$", "line %d: %s" % (n, line))
+
+    def test_prepare_step_uses_the_validation_script(self):
+        text = WORKFLOW.read_text()
+        self.assertIn("bash .github/scripts/prepare-target.sh", text)
+        self.assertNotIn("grep -Eq '^[0-9a-f]{40}$'", text)
 
 
 if __name__ == "__main__":

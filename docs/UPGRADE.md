@@ -111,6 +111,13 @@ push now really ships once a deploy runs. A plugin push alone does not start a d
   Wire `env: staging` from the plugin's `staging` branch first. Do not wire `env: prod`
   until the release path in `docs/RELEASE_SEQUENCING.md` is decided.
 
+Dispatch inputs are untrusted text. `.github/scripts/prepare-target.sh` accepts only
+`ref` exactly `main` or `staging`, `env` exactly `staging` or `prod`, and a plugin SHA of
+exactly 40 lowercase hex characters (length and charset, so a value with a newline cannot
+pass), and writes only validated values to `$GITHUB_OUTPUT`. `deploy-outpost.sh` and the
+`Dockerfile` repeat the SHA check. `scripts/test_deploy_pipeline.py` covers multi-line,
+short, long, uppercase and injected values.
+
 `workflow_dispatch` and `repository_dispatch` only work once this workflow file is on the
 default branch.
 

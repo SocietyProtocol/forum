@@ -43,6 +43,13 @@ jobs:
       checkout_ref: ${{ steps.t.outputs.checkout_ref }}
       plugin_sha: ${{ steps.t.outputs.plugin_sha }}
     steps:
+      # Needed only to run the validation script that belongs to this workflow run.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Inputs and the dispatch payload are untrusted text. They reach the script only
+      # through env vars (never interpolated into shell), are validated there, and only
+      # validated values or constants are written to $GITHUB_OUTPUT.
       - id: t
         env:
           EVENT: ${{ github.event_name }}
@@ -52,44 +59,7 @@ jobs:
           INPUT_SHA: ${{ inputs.plugin_sha }}
           PAYLOAD_ENV: ${{ github.event.client_payload.env }}
           PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
-        run: |
-          set -eu
-          plugin_sha=""
-          case "$EVENT" in
-            push)
-              branch="$REF_NAME"
-              checkout_ref="$PUSH_SHA"
-              ;;
-            workflow_dispatch)
-              branch="$INPUT_REF"
-              checkout_ref="$INPUT_REF"
-              plugin_sha="$INPUT_SHA"
-              ;;
-            repository_dispatch)
-              case "$PAYLOAD_ENV" in
-                staging) branch=staging ;;
-                prod) branch=main ;;
-                *) echo "client_payload.env must be staging or prod" >&2; exit 1 ;;
-              esac
-              checkout_ref="$branch"
-              plugin_sha="$PAYLOAD_SHA"
-              ;;
-            *) echo "unsupported event $EVENT" >&2; exit 1 ;;
-          esac
-          case "$branch" in
-            main) target=prod ;;
-            staging) target=staging ;;
-            *) echo "unsupported branch $branch" >&2; exit 1 ;;
-          esac
-          if [ -n "$plugin_sha" ] && ! printf '%s' "$plugin_sha" | grep -Eq '^[0-9a-f]{40}$'; then
-            echo "plugin sha must be a full 40-char lowercase SHA" >&2
-            exit 1
-          fi
-          {
-            echo "target=$target"
-            echo "checkout_ref=$checkout_ref"
-            echo "plugin_sha=$plugin_sha"
-          } >> "$GITHUB_OUTPUT"
+        run: bash .github/scripts/prepare-target.sh
 
   test:
     needs: prepare
@@ -105,6 +75,7 @@ jobs:
       - name: Shell syntax
         run: |
           bash -n .github/scripts/deploy-outpost.sh
+          bash -n .github/scripts/prepare-target.sh
           for f in disable-events.sh persist-uploads.sh fix-nginx.sh; do bash -n "$f"; done
       - name: Deploy script dry run (no AWS, no network)
         env:
@@ -134,7 +105,11 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
       - id: src
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          sha="$(git rev-parse HEAD)"
+          [ "${#sha}" -eq 40 ] || { echo "unexpected HEAD sha" >&2; exit 1; }
+          case "$sha" in *[!0123456789abcdef]*) echo "unexpected HEAD sha" >&2; exit 1 ;; esac
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::019141478782:role/society-github-deploy
@@ -177,7 +152,11 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.checkout_ref }}
       - id: src
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          sha="$(git rev-parse HEAD)"
+          [ "${#sha}" -eq 40 ] || { echo "unexpected HEAD sha" >&2; exit 1; }
+          case "$sha" in *[!0123456789abcdef]*) echo "unexpected HEAD sha" >&2; exit 1 ;; esac
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::019141478782:role/society-github-deploy

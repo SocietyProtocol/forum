@@ -18,8 +18,7 @@ RUN chmod +x /etc/runit/1.d/00-persist-uploads /etc/runit/1.d/01-disable-events 
   && rm -rf /var/www/discourse/plugins/discourse-events \
   && gem install rubyzip --no-document \
   && if [ -n "${SIWE_REF}" ]; then \
-       printf '%s' "${SIWE_REF}" | grep -Eq '^[0-9a-f]{40}$' \
-         || { echo "SIWE_REF must be a full 40-char lowercase commit SHA" >&2; exit 1; }; \
+       { [ "${#SIWE_REF}" -eq 40 ] && case "${SIWE_REF}" in *[!0123456789abcdef]*) false ;; *) true ;; esac; } || { echo "SIWE_REF must be a full 40-char lowercase commit SHA" >&2; exit 1; }; \
        git init -q /var/www/discourse/plugins/discourse-siwe-auth \
          && git -C /var/www/discourse/plugins/discourse-siwe-auth remote add origin \
               https://github.com/SocietyProtocol/discourse-siwe-auth.git \

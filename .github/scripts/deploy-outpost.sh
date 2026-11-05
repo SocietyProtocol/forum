@@ -75,17 +75,31 @@ case "$HEALTH_TIMEOUT_SECONDS$HEALTH_PORT$KEEP_IMAGES$LOCK_TIMEOUT_SECONDS" in
   *[!0-9]*) echo "HEALTH_TIMEOUT_SECONDS, HEALTH_PORT, KEEP_IMAGES and LOCK_TIMEOUT_SECONDS must be integers" >&2; exit 2 ;;
 esac
 
+# A full lowercase commit SHA, judged by length and charset. A line-anchored grep
+# regex would accept "<40 hex>\nmore" because grep matches line by line.
+is_sha40() {
+  [ "${#1}" -eq 40 ] || return 1
+  case "$1" in
+    *[!0123456789abcdef]*) return 1 ;;
+  esac
+  return 0
+}
+is_sha40 "$DEPLOY_SHA" || { echo "DEPLOY_SHA / GITHUB_SHA must be a full 40-char lowercase SHA" >&2; exit 2; }
+
 mask_url() { sed -E 's#//[^/@ ]*@#//***@#g'; }
 
 # Pin another repo's commit so the Docker build fetches exactly that SHA.
 PIN_TAG_SUFFIX=""
 if [ -n "$PIN_REPO_URL" ]; then
   : "${PIN_BUILD_ARG:?set PIN_BUILD_ARG with PIN_REPO_URL}"
+  case "$PIN_BUILD_ARG" in
+    ""|[0-9]*|*[!A-Za-z0-9_]*) echo "PIN_BUILD_ARG must be a plain identifier" >&2; exit 2 ;;
+  esac
   if [ -z "$PIN_SHA" ]; then
     PIN_SHA="$(git ls-remote "$PIN_REPO_URL" "refs/heads/${PIN_BRANCH}" | awk 'NR==1 {print $1}')"
   fi
-  if ! printf '%s' "$PIN_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
-    echo "could not resolve a 40-char SHA for ${PIN_BRANCH} of $(printf '%s' "$PIN_REPO_URL" | mask_url)" >&2
+  if ! is_sha40 "$PIN_SHA"; then
+    echo "could not resolve a valid 40-char lowercase SHA for ${PIN_BRANCH} of $(printf '%s' "$PIN_REPO_URL" | mask_url)" >&2
     exit 1
   fi
   echo "pinned ${PIN_BUILD_ARG}=${PIN_SHA} (branch ${PIN_BRANCH} of $(printf '%s' "$PIN_REPO_URL" | mask_url))"
