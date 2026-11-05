@@ -15,6 +15,12 @@
 #                                       (required with PIN_REPO_URL). A new SHA also
 #                                       busts the Docker layer cache.
 #   PIN_SHA                             skip ls-remote, use this full SHA
+#   PIN_FILE                            default ${CONTEXT}/.plugin-pin. When PIN_SHA is
+#                                       empty and this file exists with a non-empty
+#                                       value (one full SHA, surrounding whitespace
+#                                       ignored), that SHA is used instead of the branch
+#                                       tip. This is what makes a pin survive later
+#                                       pushes; PIN_SHA still wins over the file.
 #   HEALTH_URL_PATH                     enable the post-deploy check, e.g. /srv/status
 #   HEALTH_CONTAINER                    default society-${SERVICE}-1
 #   HEALTH_PORT                         default 80 (port inside the container)
@@ -57,6 +63,7 @@ PIN_REPO_URL="${PIN_REPO_URL:-}"
 PIN_BRANCH="${PIN_BRANCH:-main}"
 PIN_BUILD_ARG="${PIN_BUILD_ARG:-}"
 PIN_SHA="${PIN_SHA:-}"
+PIN_FILE="${PIN_FILE:-${CONTEXT}/.plugin-pin}"
 HEALTH_URL_PATH="${HEALTH_URL_PATH:-}"
 HEALTH_CONTAINER="${HEALTH_CONTAINER:-society-${SERVICE}-1}"
 HEALTH_PORT="${HEALTH_PORT:-80}"
@@ -98,14 +105,28 @@ if [ -n "$PIN_REPO_URL" ]; then
   case "$PIN_BUILD_ARG" in
     ""|[0-9]*|*[!A-Za-z0-9_]*) echo "PIN_BUILD_ARG must be a plain identifier" >&2; exit 2 ;;
   esac
+  PIN_SOURCE="explicit PIN_SHA"
+  if [ -z "$PIN_SHA" ] && [ -f "$PIN_FILE" ]; then
+    pin_text="$(cat "$PIN_FILE")"
+    # trim leading and trailing whitespace (including CR) but keep inner newlines,
+    # so a multi-line file is rejected by the SHA check below instead of merged
+    pin_text="${pin_text%"${pin_text##*[![:space:]]}"}"
+    pin_text="${pin_text#"${pin_text%%[![:space:]]*}"}"
+    if [ -n "$pin_text" ]; then
+      is_sha40 "$pin_text" || { echo "${PIN_FILE} must contain exactly one 40-char lowercase commit SHA (or be empty to follow the branch tip)" >&2; exit 1; }
+      PIN_SHA="$pin_text"
+      PIN_SOURCE="${PIN_FILE}"
+    fi
+  fi
   if [ -z "$PIN_SHA" ]; then
+    PIN_SOURCE="tip of ${PIN_BRANCH}"
     PIN_SHA="$(git ls-remote "$PIN_REPO_URL" "refs/heads/${PIN_BRANCH}" | awk 'NR==1 {print $1}')"
   fi
   if ! is_sha40 "$PIN_SHA"; then
     echo "could not resolve a valid 40-char lowercase SHA for ${PIN_BRANCH} of $(printf '%s' "$PIN_REPO_URL" | mask_url)" >&2
     exit 1
   fi
-  echo "pinned ${PIN_BUILD_ARG}=${PIN_SHA} (branch ${PIN_BRANCH} of $(printf '%s' "$PIN_REPO_URL" | mask_url))"
+  echo "pinned ${PIN_BUILD_ARG}=${PIN_SHA} from ${PIN_SOURCE} (branch ${PIN_BRANCH} of $(printf '%s' "$PIN_REPO_URL" | mask_url))"
   BUILD_ARGS="${BUILD_ARGS} --build-arg ${PIN_BUILD_ARG}=${PIN_SHA}"
   PIN_TAG_SUFFIX="-p${PIN_SHA:0:7}"
 fi

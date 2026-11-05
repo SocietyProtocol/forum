@@ -64,13 +64,32 @@ not exist on AWS. The equivalent, prod container `society-prod-forum-1`, Postgre
 7. **Re-enable SIWE login** and sign in once with a migrated wallet: it must land on the existing user.
 
 Rollback before step 6: disable SIWE login, restore from the backup tables or the dump, and redeploy
-the previous plugin commit (workflow input `plugin_sha`).
+the previous plugin commit. **The workflow input `plugin_sha` pins that commit for one run only**
+(see the warning under Option B): commit the SHA to `.plugin-pin` on `main` as well, or the next push
+to `main` rebuilds the plugin tip. If only the forum image is at fault, the faster rollback is the
+`society-forum:prod-good` image (`docs/UPGRADE.md` section 7).
 
 ## Option B: ship gating and sync to prod without Light Account login
 
 Cherry-pick the gating and sync commits onto a branch cut from the plugin's `origin/main`, then deploy
-that commit to prod with the workflow input `plugin_sha` (a commit that is not on `main` can be built;
-the pipeline fetches it by SHA). Merge the Light Account work later, following Option A at that time.
+that commit to prod (a commit that is not on `main` can be built; the pipeline fetches it by SHA).
+Merge the Light Account work later, following Option A at that time.
+
+> **Warning: the workflow input `plugin_sha` is one-shot.** It pins the plugin for that single run
+> and is stored nowhere. The next ordinary push to forum `main` (a hotfix, the monthly Discourse
+> bump, any change outside `docs/` and `*.md`) takes the push path, which resolves the plugin
+> `main` tip again and rebuilds prod from it, silently dropping the cherry-picked commit and
+> possibly shipping the Light Account login that creates duplicate, empty forum users.
+>
+> To make Option B (and any pinned rollback) stick, **also commit the SHA to `.plugin-pin`** at the
+> root of forum `main`: one full 40-char lowercase SHA, nothing else. While the file is non-empty,
+> every deploy of that branch (push, `workflow_dispatch`, `repository_dispatch`) builds exactly that
+> plugin commit and the post-deploy check asserts it; a `plugin_sha` given explicitly to a run still
+> wins for that run. The file is per branch: `staging` has its own, and merging `staging` into
+> `main` carries a staging `.plugin-pin` over, so look at it in every PR. A `plugin-updated`
+> dispatch without a `sha` also follows the file, not the new plugin tip, until the file is
+> updated or emptied (delete the line, or the file, to follow the branch tip again). A malformed
+> file fails the deploy instead of falling back to the tip.
 Check how the cherry-picked sync code resolves `S` versus `E` before choosing this: the plan (F2/F3) says
 the new features need Light Account addresses.
 

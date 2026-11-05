@@ -111,6 +111,15 @@ push now really ships once a deploy runs. A plugin push alone does not start a d
   Wire `env: staging` from the plugin's `staging` branch first. Do not wire `env: prod`
   until the release path in `docs/RELEASE_SEQUENCING.md` is decided.
 
+**Pins.** What a build uses for the plugin, first match wins: the `plugin_sha` workflow input or
+dispatch `sha` (that run only), the SHA in `.plugin-pin` at the root of the deployed branch (see
+below), the tip of the plugin branch. `plugin_sha` alone is **one-shot**: the next push to
+the branch re-resolves the tip. To hold a plugin commit across pushes, commit it to `.plugin-pin`
+(one full lowercase SHA, nothing else; empty or absent means follow the tip). The test job
+checks the file's format, and the post-deploy check asserts the container runs that commit. The file is per
+branch and rides along when `staging` is merged into `main`. `docs/RELEASE_SEQUENCING.md`
+explains why this matters for Option B.
+
 Dispatch inputs are untrusted text. `.github/scripts/prepare-target.sh` accepts only
 `ref` exactly `main` or `staging`, `env` exactly `staging` or `prod`, and a plugin SHA of
 exactly 40 lowercase hex characters (length and charset, so a value with a newline cannot
@@ -157,6 +166,11 @@ docker image ls society-forum
 docker tag society-forum:prod-good society-forum:prod
 cd /opt/society && docker compose -f apps.yml up -d --no-deps --force-recreate prod-forum
 ```
+
+**Rolling back a plugin pin:** if the bad release was a plugin commit chosen with `plugin_sha`,
+rolling back by re-running with the old SHA only lasts until the next push; commit the old SHA
+to `.plugin-pin` too (section 5), or use the `-good` image above, which the next push to the branch
+will also replace by a fresh build of whatever the branch and pin resolve to.
 
 This is the command a failed deploy prints. Nothing rolls back automatically: a failed prod
 health check leaves the broken container running until someone runs it. After the rollback

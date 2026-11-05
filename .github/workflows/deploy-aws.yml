@@ -25,7 +25,7 @@ on:
         required: true
         default: staging
       plugin_sha:
-        description: "Optional 40-char discourse-siwe-auth commit to pin (default: branch tip)"
+        description: "Optional 40-char discourse-siwe-auth commit for THIS run only (default: .plugin-pin, else branch tip)"
         type: string
         required: false
   repository_dispatch:
@@ -89,6 +89,23 @@ jobs:
           HEALTH_URL_PATH: /srv/status
           DRY_RUN: "1"
         run: bash .github/scripts/deploy-outpost.sh > /dev/null
+
+      - name: .plugin-pin is a valid SHA (when set)
+        env:
+          IMAGE: society-forum:test
+          SERVICE: test-forum
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PIN_REPO_URL: https://example.invalid/plugin.git
+          PIN_BUILD_ARG: SIWE_REF
+          DRY_RUN: "1"
+        run: |
+          # PIN_SHA is deliberately unset so the file is what gets validated.
+          if [ -f .plugin-pin ] && [ -n "$(tr -d ' \t\r\n' < .plugin-pin)" ]; then
+            bash .github/scripts/deploy-outpost.sh | grep '^pinned '
+          else
+            echo "no .plugin-pin: deploys follow the plugin branch tip"
+          fi
 
   deploy-staging:
     needs: [prepare, test]

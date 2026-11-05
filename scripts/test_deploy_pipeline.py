@@ -31,8 +31,14 @@ SHA_C = "c" * 40
 IMAGE = "society-forum:prod"
 
 
+# A directory with no .plugin-pin, so the repo's own file (if one is ever committed)
+# never leaks into tests that do not set up a pin.
+EMPTY_CONTEXT = tempfile.mkdtemp(prefix="emptyctx.")
+
+
 def base_env(**extra):
     env = {
+        "CONTEXT": EMPTY_CONTEXT,
         "PATH": os.environ["PATH"],
         "HOME": os.environ.get("HOME", "/"),
         "IMAGE": IMAGE,
@@ -566,6 +572,89 @@ class RollbackImageTests(BoxTestCase):
         self.assertEqual(final[GOOD], "sha256:X")
         self.assertEqual(final[PREV], "sha256:old2")
         self.assertEqual(final[t(5)], "sha256:old5")
+
+
+class PluginPinFileTests(BoxTestCase):
+    """.plugin-pin makes a pin survive pushes; absent or empty means the branch tip."""
+
+    def ctx_with_pin(self, content):
+        d = Path(tempfile.mkdtemp(prefix="pinctx.", dir=self.box.dir))
+        if content is not None:
+            (d / ".plugin-pin").write_bytes(content.encode())
+        return str(d)
+
+    def push_env(self, ctx, **kw):
+        # What a push to main looks like: no PIN_SHA. A URL that cannot be reached
+        # proves the branch tip is not looked up when the file supplies the SHA.
+        env = base_env(PIN_SHA="", CONTEXT=ctx, PIN_REPO_URL="https://example.invalid/plugin.git")
+        env.update(kw)
+        return env
+
+    def local_repo(self):
+        d = Path(tempfile.mkdtemp(prefix="pluginrepo.", dir=self.box.dir))
+        genv = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                    GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        subprocess.run(["git", "init", "-q", "-b", "main", str(d)], check=True)
+        subprocess.run(["git", "-C", str(d), "commit", "-q", "--allow-empty", "-m", "x"],
+                       check=True, env=genv)
+        tip = subprocess.run(["git", "-C", str(d), "rev-parse", "HEAD"], capture_output=True,
+                             text=True, check=True).stdout.strip()
+        return str(d), tip
+
+    def test_pin_file_wins_over_the_branch_tip_on_a_push(self):
+        script = remote_script(self.push_env(self.ctx_with_pin(SHA_C + "\n")))
+        self.assertIn("SIWE_REF=" + SHA_C, script)
+        self.assertIn("export PIN_SHA=" + SHA_C, script)  # the health check asserts this
+        self.assertIn("-p" + SHA_C[:7], script)
+
+    def test_whitespace_and_crlf_around_the_sha_are_ignored(self):
+        for content in ("  " + SHA_C + "  \n\n", SHA_C + "\r\n", "\n" + SHA_C):
+            script = remote_script(self.push_env(self.ctx_with_pin(content)))
+            self.assertIn("export PIN_SHA=" + SHA_C, script, repr(content))
+
+    def test_absent_or_blank_file_follows_the_branch_tip(self):
+        repo, tip = self.local_repo()
+        for content in (None, "", "  \n\n", "\r\n"):
+            ctx = self.ctx_with_pin(content)
+            script = remote_script(self.push_env(ctx, PIN_REPO_URL=repo))
+            self.assertIn("export PIN_SHA=" + tip, script, repr(content))
+
+    def test_invalid_pin_file_fails_the_deploy_instead_of_following_the_tip(self):
+        repo, _ = self.local_repo()
+        for label, content in (
+            ("short", "abc1234\n"),
+            ("uppercase", "A" * 40),
+            ("two lines", SHA_B + "\n" + SHA_C + "\n"),
+            ("injected line", SHA_B + "\n--build-arg X=1\n"),
+            ("words", "main"),
+            ("inner space", "a" * 20 + " " + "a" * 19),
+        ):
+            rc, out, err = dry_run(self.push_env(self.ctx_with_pin(content), PIN_REPO_URL=repo))
+            self.assertNotEqual(rc, 0, "%s pin file accepted" % label)
+            self.assertIn(".plugin-pin", err, label)
+
+    def test_explicit_plugin_sha_overrides_the_file(self):
+        script = remote_script(self.push_env(self.ctx_with_pin(SHA_C), PIN_SHA=SHA_B))
+        self.assertIn("export PIN_SHA=" + SHA_B, script)
+        self.assertNotIn(SHA_C, script)
+
+    def test_pin_file_is_ignored_without_a_plugin_pin_repo(self):
+        script = remote_script(self.push_env(self.ctx_with_pin(SHA_C), PIN_REPO_URL="",
+                                             PIN_BUILD_ARG=""))
+        self.assertNotIn(SHA_C, script)
+
+    def test_health_check_asserts_the_file_pin_and_fails_when_the_container_runs_the_tip(self):
+        ctx = self.ctx_with_pin(SHA_C + "\n")
+        self.box.seed({IMAGE: "sha256:W", GOOD: "sha256:W"}, running="sha256:W")
+        env = dict(PIN_SHA="", CONTEXT=ctx, PIN_REPO_URL="https://example.invalid/plugin.git")
+        ok = self.box.deploy(extra_env=env, run_extra={"STUB_PLUGIN_SHA": SHA_C})
+        self.assertEqual(ok.returncode, 0, ok.stderr + ok.stdout)
+        # a later build whose container runs a different plugin commit (the tip) must fail
+        self.box.seed({IMAGE: "sha256:W", GOOD: "sha256:W"}, running="sha256:W")
+        bad = self.box.deploy(extra_env=env, run_extra={"STUB_PLUGIN_SHA": "d" * 40})
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("!= pinned " + SHA_C, bad.stderr)
+        self.assertEqual(self.box.tags()[GOOD], "sha256:W")
 
 
 if __name__ == "__main__":
