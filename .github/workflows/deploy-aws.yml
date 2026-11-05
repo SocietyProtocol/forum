@@ -1,29 +1,193 @@
 name: Deploy to AWS
 
+# Triggers
+#  - push to main (prod) or staging (staging), except docs-only changes
+#  - workflow_dispatch: redeploy a branch by hand (optionally pin a plugin SHA)
+#  - repository_dispatch "plugin-updated": the discourse-siwe-auth repo asks for a
+#    redeploy of one environment so the new plugin commit ships. Body:
+#    {"event_type":"plugin-updated","client_payload":{"env":"staging"|"prod","sha":"<optional 40-char plugin SHA>"}}
+#    GitHub runs repository_dispatch (and lists workflow_dispatch) from the default
+#    branch, so this file must be on the default branch for those two to work.
 on:
   push:
     branches: [main, staging]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".env.example"
+      - ".env.staging.example"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch to deploy (main = prod, staging = staging)"
+        type: choice
+        options: [staging, main]
+        required: true
+        default: staging
+      plugin_sha:
+        description: "Optional 40-char discourse-siwe-auth commit to pin (default: branch tip)"
+        type: string
+        required: false
+  repository_dispatch:
+    types: [plugin-updated]
 
 permissions:
   id-token: write
   contents: read
 
-concurrency:
-  group: aws-outpost-forum
-  cancel-in-progress: false
-
 jobs:
-  deploy:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.t.outputs.target }}
+      checkout_ref: ${{ steps.t.outputs.checkout_ref }}
+      plugin_sha: ${{ steps.t.outputs.plugin_sha }}
+    steps:
+      - id: t
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_SHA: ${{ inputs.plugin_sha }}
+          PAYLOAD_ENV: ${{ github.event.client_payload.env }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -eu
+          plugin_sha=""
+          case "$EVENT" in
+            push)
+              branch="$REF_NAME"
+              checkout_ref="$PUSH_SHA"
+              ;;
+            workflow_dispatch)
+              branch="$INPUT_REF"
+              checkout_ref="$INPUT_REF"
+              plugin_sha="$INPUT_SHA"
+              ;;
+            repository_dispatch)
+              case "$PAYLOAD_ENV" in
+                staging) branch=staging ;;
+                prod) branch=main ;;
+                *) echo "client_payload.env must be staging or prod" >&2; exit 1 ;;
+              esac
+              checkout_ref="$branch"
+              plugin_sha="$PAYLOAD_SHA"
+              ;;
+            *) echo "unsupported event $EVENT" >&2; exit 1 ;;
+          esac
+          case "$branch" in
+            main) target=prod ;;
+            staging) target=staging ;;
+            *) echo "unsupported branch $branch" >&2; exit 1 ;;
+          esac
+          if [ -n "$plugin_sha" ] && ! printf '%s' "$plugin_sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "plugin sha must be a full 40-char lowercase SHA" >&2
+            exit 1
+          fi
+          {
+            echo "target=$target"
+            echo "checkout_ref=$checkout_ref"
+            echo "plugin_sha=$plugin_sha"
+          } >> "$GITHUB_OUTPUT"
+
+  test:
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - name: Placeholder and Dockerfile checks
+        run: python3 scripts/test_placeholders.py
+      - name: Shell syntax
+        run: |
+          bash -n .github/scripts/deploy-outpost.sh
+          for f in disable-events.sh persist-uploads.sh fix-nginx.sh; do bash -n "$f"; done
+      - name: Deploy script dry run (no AWS, no network)
+        env:
+          IMAGE: society-forum:test
+          SERVICE: test-forum
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PIN_REPO_URL: https://example.invalid/plugin.git
+          PIN_BUILD_ARG: SIWE_REF
+          PIN_SHA: "0000000000000000000000000000000000000000"
+          HEALTH_URL_PATH: /srv/status
+          DRY_RUN: "1"
+        run: bash .github/scripts/deploy-outpost.sh > /dev/null
+
+  deploy-staging:
+    needs: [prepare, test]
+    if: needs.prepare.outputs.target == 'staging'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: aws-outpost-forum-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - id: src
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::019141478782:role/society-github-deploy
           aws-region: us-east-1
-      - name: Deploy the forum
+      - name: Deploy the staging forum
         env:
-          IMAGE: ${{ github.ref_name == 'staging' && 'society-forum:staging' || 'society-forum:prod' }}
-          SERVICE: ${{ github.ref_name == 'staging' && 'staging-forum' || 'prod-forum' }}
-          BUILD_ARGS: ${{ github.ref_name == 'staging' && '--build-arg SIWE_BRANCH=staging' || '' }}
+          IMAGE: society-forum:staging
+          SERVICE: staging-forum
+          DEPLOY_SHA: ${{ steps.src.outputs.sha }}
+          BUILD_ARGS: --build-arg SIWE_BRANCH=staging --build-arg FORUM_REVISION=${{ steps.src.outputs.sha }}
+          PIN_REPO_URL: https://github.com/SocietyProtocol/discourse-siwe-auth.git
+          PIN_BRANCH: staging
+          PIN_BUILD_ARG: SIWE_REF
+          PIN_SHA: ${{ needs.prepare.outputs.plugin_sha }}
+          HEALTH_CONTAINER: society-staging-forum-1
+          HEALTH_URL_PATH: /srv/status
+          HEALTH_EXPECT_BODY: ok
+          HEALTH_PLUGIN_DIR: /var/www/discourse/plugins/discourse-siwe-auth
+          # Opt-in migration hook, see docs/UPGRADE.md before enabling:
+          # POST_DEPLOY_CMD: cd /var/www/discourse && su discourse -c 'bundle exec rake db:migrate'
+        run: bash .github/scripts/deploy-outpost.sh
+
+  deploy-prod:
+    needs: [prepare, test]
+    if: needs.prepare.outputs.target == 'prod'
+    runs-on: ubuntu-latest
+    # A reviewer gate needs the "production" environment to exist with required
+    # reviewers (GitHub settings). Until it is configured this job runs unattended.
+    environment:
+      name: production
+      url: https://forum.societyprotocol.io
+    concurrency:
+      group: aws-outpost-forum-prod
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - id: src
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::019141478782:role/society-github-deploy
+          aws-region: us-east-1
+      - name: Deploy the prod forum
+        env:
+          IMAGE: society-forum:prod
+          SERVICE: prod-forum
+          DEPLOY_SHA: ${{ steps.src.outputs.sha }}
+          BUILD_ARGS: --build-arg SIWE_BRANCH=main --build-arg FORUM_REVISION=${{ steps.src.outputs.sha }}
+          PIN_REPO_URL: https://github.com/SocietyProtocol/discourse-siwe-auth.git
+          PIN_BRANCH: main
+          PIN_BUILD_ARG: SIWE_REF
+          PIN_SHA: ${{ needs.prepare.outputs.plugin_sha }}
+          HEALTH_CONTAINER: society-prod-forum-1
+          HEALTH_URL_PATH: /srv/status
+          HEALTH_EXPECT_BODY: ok
+          HEALTH_PLUGIN_DIR: /var/www/discourse/plugins/discourse-siwe-auth
+          # Opt-in migration hook, see docs/UPGRADE.md before enabling:
+          # POST_DEPLOY_CMD: cd /var/www/discourse && su discourse -c 'bundle exec rake db:migrate'
         run: bash .github/scripts/deploy-outpost.sh
