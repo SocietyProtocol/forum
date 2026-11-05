@@ -1,29 +1,213 @@
 name: Deploy to AWS
 
+# Triggers
+#  - push to main (prod) or staging (staging), except docs-only changes
+#  - workflow_dispatch: redeploy a branch by hand (optionally pin a plugin SHA)
+#  - repository_dispatch "plugin-updated": the discourse-siwe-auth repo asks for a
+#    redeploy of one environment so the new plugin commit ships. Body:
+#    {"event_type":"plugin-updated","client_payload":{"env":"staging"|"prod","sha":"<optional 40-char plugin SHA>"}}
+#    GitHub runs repository_dispatch (and lists workflow_dispatch) from the default
+#    branch, so this file must be on the default branch for those two to work.
 on:
   push:
     branches: [main, staging]
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+      - ".env.example"
+      - ".env.staging.example"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch to deploy (main = prod, staging = staging)"
+        type: choice
+        options: [staging, main]
+        required: true
+        default: staging
+      plugin_sha:
+        description: "Optional 40-char discourse-siwe-auth commit for THIS run only (default: .plugin-pin, else branch tip)"
+        type: string
+        required: false
+  repository_dispatch:
+    types: [plugin-updated]
 
+# Read-only by default. The OIDC token that lets a job assume the AWS role is granted
+# per job, to the two deploy jobs only (prepare and test run no AWS code).
 permissions:
-  id-token: write
   contents: read
 
-concurrency:
-  group: aws-outpost-forum
-  cancel-in-progress: false
-
 jobs:
-  deploy:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.t.outputs.target }}
+      checkout_ref: ${{ steps.t.outputs.checkout_ref }}
+      plugin_sha: ${{ steps.t.outputs.plugin_sha }}
+    steps:
+      # Needed only to run the validation script that belongs to this workflow run.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Inputs and the dispatch payload are untrusted text. They reach the script only
+      # through env vars (never interpolated into shell), are validated there, and only
+      # validated values or constants are written to $GITHUB_OUTPUT.
+      - id: t
+        env:
+          EVENT: ${{ github.event_name }}
+          PUSH_SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_SHA: ${{ inputs.plugin_sha }}
+          PAYLOAD_ENV: ${{ github.event.client_payload.env }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: bash .github/scripts/prepare-target.sh
+
+  test:
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - name: Placeholder and Dockerfile checks
+        run: python3 scripts/test_placeholders.py
+      - name: Deploy pipeline tests (stubbed docker, aws and flock)
+        run: python3 scripts/test_deploy_pipeline.py
+      - name: Shell syntax
+        run: |
+          bash -n .github/scripts/deploy-outpost.sh
+          bash -n .github/scripts/prepare-target.sh
+          for f in disable-events.sh persist-uploads.sh fix-nginx.sh; do bash -n "$f"; done
+      - name: Deploy script dry run (no AWS, no network)
+        env:
+          IMAGE: society-forum:test
+          SERVICE: test-forum
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PIN_REPO_URL: https://example.invalid/plugin.git
+          PIN_BUILD_ARG: SIWE_REF
+          PIN_SHA: "0000000000000000000000000000000000000000"
+          HEALTH_URL_PATH: /srv/status
+          DRY_RUN: "1"
+        run: bash .github/scripts/deploy-outpost.sh > /dev/null
+
+      - name: .plugin-pin is a valid SHA (when set)
+        env:
+          IMAGE: society-forum:test
+          SERVICE: test-forum
+          GITHUB_SHA: ${{ github.sha }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PIN_REPO_URL: https://example.invalid/plugin.git
+          PIN_BUILD_ARG: SIWE_REF
+          DRY_RUN: "1"
+        run: |
+          # PIN_SHA is deliberately unset so the file is what gets validated.
+          if [ -f .plugin-pin ] && [ -n "$(tr -d ' \t\r\n' < .plugin-pin)" ]; then
+            bash .github/scripts/deploy-outpost.sh | grep '^pinned '
+          else
+            echo "no .plugin-pin: deploys follow the plugin branch tip"
+          fi
+
+  deploy-staging:
+    needs: [prepare, test]
+    if: needs.prepare.outputs.target == 'staging'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    # A named environment gives the OIDC token the subject
+    # repo:<owner>/<repo>:environment:staging (see docs/UPGRADE.md section 12 for
+    # narrowing the AWS role trust policy to it). GitHub creates the environment on
+    # first use; no reviewers are required for staging.
+    environment:
+      name: staging
+      url: https://staging-forum.societyprotocol.io
+    # One group for every forum deploy: staging and prod run on the same box, share
+    # its docker daemon and CPU/RAM, so they must queue, not overlap. A queued run
+    # that is replaced by a newer queued run shows as "Canceled"; re-run it.
+    concurrency:
+      group: aws-outpost-forum
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - id: src
+        run: |
+          sha="$(git rev-parse HEAD)"
+          [ "${#sha}" -eq 40 ] || { echo "unexpected HEAD sha" >&2; exit 1; }
+          case "$sha" in *[!0123456789abcdef]*) echo "unexpected HEAD sha" >&2; exit 1 ;; esac
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::019141478782:role/society-github-deploy
           aws-region: us-east-1
-      - name: Deploy the forum
+      - name: Deploy the staging forum
         env:
-          IMAGE: ${{ github.ref_name == 'staging' && 'society-forum:staging' || 'society-forum:prod' }}
-          SERVICE: ${{ github.ref_name == 'staging' && 'staging-forum' || 'prod-forum' }}
-          BUILD_ARGS: ${{ github.ref_name == 'staging' && '--build-arg SIWE_BRANCH=staging' || '' }}
+          IMAGE: society-forum:staging
+          SERVICE: staging-forum
+          DEPLOY_SHA: ${{ steps.src.outputs.sha }}
+          BUILD_ARGS: --build-arg SIWE_BRANCH=staging --build-arg FORUM_REVISION=${{ steps.src.outputs.sha }}
+          PIN_REPO_URL: https://github.com/SocietyProtocol/discourse-siwe-auth.git
+          PIN_BRANCH: staging
+          PIN_BUILD_ARG: SIWE_REF
+          PIN_SHA: ${{ needs.prepare.outputs.plugin_sha }}
+          HEALTH_CONTAINER: society-staging-forum-1
+          HEALTH_URL_PATH: /srv/status
+          HEALTH_EXPECT_BODY: ok
+          HEALTH_PLUGIN_DIR: /var/www/discourse/plugins/discourse-siwe-auth
+          # Opt-in migration hook, see docs/UPGRADE.md before enabling:
+          # POST_DEPLOY_CMD: cd /var/www/discourse && su discourse -c 'bundle exec rake db:migrate'
+        run: bash .github/scripts/deploy-outpost.sh
+
+  deploy-prod:
+    needs: [prepare, test]
+    if: needs.prepare.outputs.target == 'prod'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    # A reviewer gate needs the "production" environment to exist with required
+    # reviewers (GitHub settings). Until it is configured this job runs unattended.
+    # The gate only protects the box once the AWS role trust policy is limited to
+    # the environment:production subject (docs/UPGRADE.md section 12).
+    environment:
+      name: production
+      url: https://forum.societyprotocol.io
+    # One group for every forum deploy: staging and prod run on the same box, share
+    # its docker daemon and CPU/RAM, so they must queue, not overlap. A queued run
+    # that is replaced by a newer queued run shows as "Canceled"; re-run it.
+    concurrency:
+      group: aws-outpost-forum
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.checkout_ref }}
+      - id: src
+        run: |
+          sha="$(git rev-parse HEAD)"
+          [ "${#sha}" -eq 40 ] || { echo "unexpected HEAD sha" >&2; exit 1; }
+          case "$sha" in *[!0123456789abcdef]*) echo "unexpected HEAD sha" >&2; exit 1 ;; esac
+          printf 'sha=%s\n' "$sha" >> "$GITHUB_OUTPUT"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::019141478782:role/society-github-deploy
+          aws-region: us-east-1
+      - name: Deploy the prod forum
+        env:
+          IMAGE: society-forum:prod
+          SERVICE: prod-forum
+          DEPLOY_SHA: ${{ steps.src.outputs.sha }}
+          BUILD_ARGS: --build-arg SIWE_BRANCH=main --build-arg FORUM_REVISION=${{ steps.src.outputs.sha }}
+          PIN_REPO_URL: https://github.com/SocietyProtocol/discourse-siwe-auth.git
+          PIN_BRANCH: main
+          PIN_BUILD_ARG: SIWE_REF
+          PIN_SHA: ${{ needs.prepare.outputs.plugin_sha }}
+          HEALTH_CONTAINER: society-prod-forum-1
+          HEALTH_URL_PATH: /srv/status
+          HEALTH_EXPECT_BODY: ok
+          HEALTH_PLUGIN_DIR: /var/www/discourse/plugins/discourse-siwe-auth
+          # Opt-in migration hook, see docs/UPGRADE.md before enabling:
+          # POST_DEPLOY_CMD: cd /var/www/discourse && su discourse -c 'bundle exec rake db:migrate'
         run: bash .github/scripts/deploy-outpost.sh
