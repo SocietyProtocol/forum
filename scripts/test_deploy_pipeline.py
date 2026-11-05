@@ -657,5 +657,35 @@ class PluginPinFileTests(BoxTestCase):
         self.assertEqual(self.box.tags()[GOOD], "sha256:W")
 
 
+def workflow_jobs():
+    """Split the workflow into {job name: text} and return it with the header text."""
+    text = WORKFLOW.read_text()
+    head, _, body = text.partition("\njobs:\n")
+    parts = re.split(r"^  ([A-Za-z][\w-]*):\s*$", body, flags=re.M)
+    return head, dict(zip(parts[1::2], parts[2::2]))
+
+
+class WorkflowPermissionTests(unittest.TestCase):
+    def test_workflow_level_permissions_are_read_only(self):
+        head, _ = workflow_jobs()
+        m = re.search(r"^permissions:\n((?:  .*\n)+)", head + "\n", re.M)
+        self.assertIsNotNone(m, "no workflow-level permissions block")
+        self.assertEqual(m.group(1).split(), ["contents:", "read"])
+
+    def test_id_token_is_granted_only_to_the_deploy_jobs(self):
+        _, jobs = workflow_jobs()
+        self.assertEqual(sorted(jobs), ["deploy-prod", "deploy-staging", "prepare", "test"])
+        for name, text in jobs.items():
+            has = re.search(r"^\s+id-token:\s*write\s*$", text, re.M) is not None
+            self.assertEqual(has, name.startswith("deploy-"), name)
+
+    def test_both_deploy_jobs_use_a_named_environment(self):
+        _, jobs = workflow_jobs()
+        for job, env in (("deploy-staging", "staging"), ("deploy-prod", "production")):
+            self.assertRegex(jobs[job], r"environment:\n\s+name: %s\n" % env, job)
+        for job in ("prepare", "test"):
+            self.assertNotIn("environment:", jobs[job], job)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

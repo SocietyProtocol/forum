@@ -11,7 +11,7 @@ marked **verify** were not confirmed against the live box when this was written.
 | --- | --- |
 | Docker image, Discourse version, plugin pin, deploy pipeline, backups, rollback | August |
 | Site settings (admin UI), moderation, content, verifying behaviour on staging | Fritz |
-| Production deploys | August (the `production` GitHub environment should require his approval) |
+| Production deploys | August (the `production` GitHub environment should require his approval, and only counts once the AWS role trust policy is narrowed, section 12) |
 
 Both subscribe to Discourse security announcements: watch the Announcements
 and Security categories on meta.discourse.org and the security advisories of
@@ -259,7 +259,44 @@ Also still pointing at Railway hosts: the probes in `.grok/workflows/outpost-inf
 
 ## 12. One-time setup for August
 
-- GitHub > Settings > Environments: create `production`, add required reviewers (August).
-  Until it exists with reviewers, `deploy-prod` runs without approval. `staging` uses no environment.
+- GitHub > Settings > Environments: create `production`, add required reviewers (August) and
+  restrict its deployment branches to `main`. Until it exists with reviewers, `deploy-prod` runs
+  without approval. `staging` is also a named environment now (GitHub creates it on first use);
+  it needs no reviewers.
 - Optional: a plugin-repo workflow that sends the `plugin-updated` dispatch (section 5).
 - Decide whether to enable `POST_DEPLOY_CMD` after reading section 3 "Migrations".
+
+### The environment gate does not protect the prod box until the AWS trust policy is narrowed
+
+The reviewer approval on `production` only gates the `deploy-prod` job. What actually lets a
+workflow reach the box is the IAM role `society-github-deploy`, which both deploy jobs assume
+through GitHub OIDC and which can run SSM commands on the instance that hosts prod and staging.
+A review read its trust policy as accepting any subject under `repo:SocietyProtocol/forum:*` (re-check it in IAM; nothing in this repo defines it). **While
+that wildcard stands, anyone who can push a branch or workflow to the forum repo can assume the
+role from a job that has no environment, skip the approval, and run commands on the prod box.**
+The approval is a process control, not a technical barrier, until the policy is narrowed.
+
+The workflow side is done: `contents: read` at workflow level, `id-token: write` only on
+`deploy-staging` and `deploy-prod`, and each of those jobs declares an environment, so their OIDC
+subjects are `repo:SocietyProtocol/forum:environment:staging` and
+`repo:SocietyProtocol/forum:environment:production`. The AWS change (not made from this repo;
+August to do it) is to replace the wildcard `sub` condition with a `StringEquals` on exactly those
+two subjects (keep the `aud` of `sts.amazonaws.com`):
+
+```json
+"Condition": {
+  "StringEquals": {
+    "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+    "token.actions.githubusercontent.com:sub": [
+      "repo:SocietyProtocol/forum:environment:production",
+      "repo:SocietyProtocol/forum:environment:staging"
+    ]
+  }
+}
+```
+
+Do it only after this workflow has run once on each environment (a push to `staging`, then a
+`main` deploy), or the next deploy fails with `Not authorized to perform sts:AssumeRoleWithWebIdentity`.
+Other repos that assume the same role (web client, subgraph) need their own subjects added.
+Staging and prod share one box, so a separate prod role would not stop a staging job from reaching
+prod containers; the real separation is the environment's reviewers plus its branch restriction.

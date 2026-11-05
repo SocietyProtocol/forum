@@ -31,8 +31,9 @@ on:
   repository_dispatch:
     types: [plugin-updated]
 
+# Read-only by default. The OIDC token that lets a job assume the AWS role is granted
+# per job, to the two deploy jobs only (prepare and test run no AWS code).
 permissions:
-  id-token: write
   contents: read
 
 jobs:
@@ -111,6 +112,16 @@ jobs:
     needs: [prepare, test]
     if: needs.prepare.outputs.target == 'staging'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    # A named environment gives the OIDC token the subject
+    # repo:<owner>/<repo>:environment:staging (see docs/UPGRADE.md section 12 for
+    # narrowing the AWS role trust policy to it). GitHub creates the environment on
+    # first use; no reviewers are required for staging.
+    environment:
+      name: staging
+      url: https://staging-forum.societyprotocol.io
     # One group for every forum deploy: staging and prod run on the same box, share
     # its docker daemon and CPU/RAM, so they must queue, not overlap. A queued run
     # that is replaced by a newer queued run shows as "Canceled"; re-run it.
@@ -153,8 +164,13 @@ jobs:
     needs: [prepare, test]
     if: needs.prepare.outputs.target == 'prod'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
     # A reviewer gate needs the "production" environment to exist with required
     # reviewers (GitHub settings). Until it is configured this job runs unattended.
+    # The gate only protects the box once the AWS role trust policy is limited to
+    # the environment:production subject (docs/UPGRADE.md section 12).
     environment:
       name: production
       url: https://forum.societyprotocol.io
