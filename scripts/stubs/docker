@@ -51,7 +51,8 @@ elif cmd == "image" and args[1] == "ls":
     print("\n".join(seen))
 elif cmd == "rmi":
     ref = args[1]
-    if st["tags"].get(ref) and st["tags"][ref] == st["running"] and sum(1 for v in st["tags"].values() if v == st["running"]) == 1:
+    in_use = [st["running"], os.environ.get("STUB_EXTRA_RUNNING", "")]
+    if st["tags"].get(ref) in in_use and sum(1 for v in st["tags"].values() if v == st["tags"].get(ref)) == 1:
         sys.stderr.write("conflict: image in use\n")
         sys.exit(1)
     st["tags"].pop(ref, None)
@@ -83,6 +84,8 @@ elif cmd == "compose":
 elif cmd == "ps":
     if st["running"]:
         print("c1")
+    if os.environ.get("STUB_EXTRA_RUNNING"):
+        print("c2")
 elif cmd == "inspect":
     fmt = args[2]
     if "State.Running" in fmt:
@@ -90,7 +93,7 @@ elif cmd == "inspect":
     elif "Labels" in fmt:
         print(os.environ.get("STUB_LABEL_SHA", os.environ.get("STUB_PLUGIN_SHA", "")))
     elif ".Image" in fmt:
-        print(st["running"])
+        print(os.environ.get("STUB_EXTRA_RUNNING", "") if args[3] == "c2" else st["running"])
 elif cmd == "exec":
     joined = " ".join(args)
     if " curl " in joined:

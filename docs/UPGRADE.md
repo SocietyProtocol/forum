@@ -43,9 +43,9 @@ and Security categories on meta.discourse.org and the security advisories of
    `production` environment approval (one-time GitHub setup, section 12).
 6. **Before approving prod: back up the database (section 4).** The pipeline
    does not take the backup for you.
-7. **Approve.** The job builds, keeps the previous image as `society-forum:prod-prev`,
-   recreates `prod-forum`, waits up to 10 minutes for `/srv/status` and checks
-   the plugin SHA.
+7. **Approve.** The job builds, recreates `prod-forum`, waits up to 10 minutes for
+   `/srv/status` and checks the plugin SHA. Only when all of that passes does it tag the
+   new image `society-forum:prod-good` (the old `-good` becomes `-prev`, section 7).
 8. **Smoke prod** (section 8, read-only checks only).
 
 Deploys queue, they never overlap. Staging and prod run on the same box, so
@@ -130,30 +130,43 @@ exactly `ok`, for up to `HEALTH_TIMEOUT_SECONDS` (600). It then asserts that the
 plugin checkout in the container (`git rev-parse HEAD`) and the image label
 `io.societyprotocol.siwe-auth.ref` both equal the SHA that was built, and prints the
 `# version:` line of `plugin.rb`. On any failure the job exits non-zero and prints the last 50 log lines
-(credentials masked) plus the rollback command. Other services opt in by setting
+(credentials masked) plus the exact rollback command, which restores `society-forum:<env>-good`. Other services opt in by setting
 `HEALTH_URL_PATH`; without it the script behaves as before.
 
 ## 7. Rollback
 
-Every build is tagged `society-forum:<env>-<forum sha12>[-p<plugin sha7>]`; the image
-that was current before the build is kept as `society-forum:<env>-prev`
-(not overwritten when the same build is re-run). The newest 5 SHA tags are kept.
+Every build is tagged `society-forum:<env>-<forum sha12>[-p<plugin sha7>]` (the newest 5 are kept).
+Two more tags are the rollback targets, and they move **only after a deploy has passed its checks**:
+
+- `society-forum:<env>-good`: the last release whose container passed the health check and the
+  plugin assertion (or, for a service without a health check, whose `docker compose up` succeeded).
+- `society-forum:<env>-prev`: the `-good` before that one.
+
+On success the job first tags the old `-good` as `-prev`, then tags the new image as `-good`.
+A failed build, a failed `compose up` or a failed health check never touches either tag, so
+`-good` is the release to return to even after several failed attempts in a row. A re-run of the
+build that is already `-good` leaves `-prev` alone. Pruning of the old SHA tags skips anything that
+is `-good`, `-prev`, the current `society-forum:<env>` or used by a running container.
+`society-forum:<env>-good` was created by hand on the box from the image running when this
+pipeline was introduced, so the first deploy finds it (if `-good` is missing the failure
+output says so and the first healthy deploy creates it).
 
 ```bash
 # on the box, prod shown; for staging use staging-forum / society-forum:staging
 docker image ls society-forum
-docker tag society-forum:prod-prev society-forum:prod
+docker tag society-forum:prod-good society-forum:prod
 cd /opt/society && docker compose -f apps.yml up -d --no-deps --force-recreate prod-forum
 ```
 
-To go further back, `docker tag society-forum:prod-<sha> society-forum:prod` first.
+This is the command a failed deploy prints. Nothing rolls back automatically: a failed prod
+health check leaves the broken container running until someone runs it. After the rollback
+the live tag is `-good` again; the next healthy deploy advances `-good`/`-prev` as above.
+
+To go further back, use `society-forum:prod-prev` or `docker tag society-forum:prod-<sha> society-forum:prod`.
 If the failed release applied Discourse migrations, the old image may not run on the
 migrated schema: stop the forum and restore the pre-deploy dump
 (`pg_restore --clean --if-exists -U discourse -d discourse` inside the Postgres container).
 That loses everything written since the dump.
-
-If a failed deploy is re-run before rollback, `-prev` points at the failed image.
-Use a SHA tag then.
 
 ## 9. Never use the admin "Upgrade" button in production
 

@@ -3,7 +3,8 @@
 #
 # This script is copied by several repos (forum, web client, subgraph). Every
 # feature below is opt-in through environment variables, so a repo that sets
-# only IMAGE / SERVICE keeps the original behaviour (plus the rollback tags).
+# only IMAGE / SERVICE keeps the original behaviour (plus the rollback tags
+# <IMAGE>-good and <IMAGE>-prev, which only move after a deploy has passed its checks).
 #
 # Required:  IMAGE  SERVICE  GITHUB_SHA  GITHUB_REPOSITORY
 # Optional:
@@ -26,7 +27,9 @@
 #   POST_DEPLOY_CMD                     shell command run with `docker exec` in the new
 #                                       container before the health wait, for example
 #                                       a database migration. Not set by default.
-#   KEEP_IMAGES                         SHA-tagged images to keep per IMAGE (default 5)
+#   KEEP_IMAGES                         SHA-tagged images to keep per IMAGE (default 5);
+#                                       images that are -good, -prev, IMAGE itself or in
+#                                       use by a container are never removed
 #   DEPLOY_SHA                          commit being deployed (default GITHUB_SHA); set it
 #                                       when the workflow checks out a ref other than
 #                                       the event commit (workflow/repository dispatch)
@@ -153,7 +156,12 @@ fail_with_logs() {
   echo "DEPLOY_FAILED ${SERVICE}: $1" >&2
   echo "--- last 50 log lines of ${HEALTH_CONTAINER} ---" >&2
   log_tail "$HEALTH_CONTAINER" >&2
-  echo "Rollback: docker tag ${IMAGE}-prev ${IMAGE} && cd /opt/society && docker compose -f apps.yml up -d --no-deps --force-recreate ${SERVICE}" >&2
+  if docker image inspect "${IMAGE}-good" >/dev/null 2>&1; then
+    echo "${IMAGE}-good and ${IMAGE}-prev were not touched by this deploy." >&2
+    echo "Rollback: docker tag ${IMAGE}-good ${IMAGE} && cd ${COMPOSE_DIR} && docker compose -f apps.yml up -d --no-deps --force-recreate ${SERVICE}" >&2
+  else
+    echo "No ${IMAGE}-good image exists. Pick one with: docker image ls ${IMAGE%:*}" >&2
+  fi
   exit 1
 }
 
@@ -164,36 +172,26 @@ if [ -n "${ENVFILE}" ]; then
   cp "${ENVFILE}" "${SRC_DIR}/.env.production"
 fi
 
-# Keep a rollback image: the current tag is about to be overwritten by the build.
-# Skip when the current image already is this exact build (a re-run), so a re-run
-# cannot overwrite the good -prev image with the same failing image.
-if docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-  cur_id="$(docker image inspect -f '{{.Id}}' "${IMAGE}")"
-  same_id="$(docker image inspect -f '{{.Id}}' "${SHA_TAG}" 2>/dev/null || true)"
-  if [ "$cur_id" != "$same_id" ]; then
-    docker tag "${IMAGE}" "${IMAGE}-prev"
-    echo "rollback image: ${IMAGE}-prev -> ${cur_id}"
-  else
-    echo "current ${IMAGE} is already ${SHA_TAG}; leaving ${IMAGE}-prev untouched"
-  fi
+# Rollback images are only ever moved AFTER this deploy has proven itself (see
+# promote_good below). The build, the recreate and a failed health check never
+# touch ${IMAGE}-good or ${IMAGE}-prev, so they always hold the last release that
+# passed its checks and the one before it.
+if docker image inspect "${IMAGE}-good" >/dev/null 2>&1; then
+  echo "rollback image: ${IMAGE}-good -> $(docker image inspect -f '{{.Id}}' "${IMAGE}-good")"
 else
-  echo "no existing ${IMAGE}; no rollback image to keep"
+  echo "warning: no ${IMAGE}-good image yet; the first healthy deploy creates it"
 fi
 
 # shellcheck disable=SC2086
-docker build --network=host ${BUILD_ARGS} -t "${IMAGE}" -t "${SHA_TAG}" "${SRC_DIR}"
+docker build --network=host ${BUILD_ARGS} -t "${IMAGE}" -t "${SHA_TAG}" "${SRC_DIR}" || {
+  echo "DEPLOY_FAILED ${SERVICE}: docker build failed. The running container, ${IMAGE}, ${IMAGE}-good and ${IMAGE}-prev were not changed." >&2
+  exit 1
+}
 rm -rf "${RUN_DIR}/src" "${RUN_DIR}/src.tgz"
 
-# Drop old SHA tags beyond KEEP_IMAGES (newest first). Untagging never removes an
-# image another tag (including -prev) or a running container still uses.
-repo_part="${IMAGE%:*}"; tag_part="${IMAGE##*:}"
-docker image ls "${repo_part}" --format '{{.Tag}}' \
-  | grep -E "^${tag_part}-[0-9a-f]{12}(-p[0-9a-f]{7})?\$" \
-  | awk -v keep="${KEEP_IMAGES}" 'NR > keep' \
-  | while read -r old; do docker rmi "${repo_part}:${old}" >/dev/null 2>&1 || true; done || true
-
 cd "${COMPOSE_DIR}"
-docker compose -f apps.yml up -d --no-deps --force-recreate "${SERVICE}"
+docker compose -f apps.yml up -d --no-deps --force-recreate "${SERVICE}" \
+  || fail_with_logs "docker compose up failed"
 
 if [ -n "${POST_DEPLOY_CMD}" ]; then
   echo "waiting for ${HEALTH_CONTAINER} to be running before POST_DEPLOY_CMD"
@@ -242,6 +240,42 @@ if [ -n "${HEALTH_URL_PATH}" ]; then
     fi
   fi
 fi
+
+# The new container passed every configured check (or compose up succeeded when
+# none is configured). Only now move the rollback tags: the old -good becomes
+# -prev and the image just deployed becomes -good. A re-run of the already-good
+# build leaves -prev alone, so it can never end up equal to -good.
+new_id="$(docker image inspect -f '{{.Id}}' "${SHA_TAG}")"
+if old_good_id="$(docker image inspect -f '{{.Id}}' "${IMAGE}-good" 2>/dev/null)" && [ "$old_good_id" != "$new_id" ]; then
+  docker tag "${IMAGE}-good" "${IMAGE}-prev"
+  echo "rollback image: ${IMAGE}-prev -> ${old_good_id}"
+fi
+docker tag "${SHA_TAG}" "${IMAGE}-good"
+echo "rollback image: ${IMAGE}-good -> ${new_id}"
+
+# Drop old SHA tags beyond KEEP_IMAGES (newest first), but never an image that is
+# the -good or -prev image, the current ${IMAGE}, or used by a container. A tag is
+# skipped when its image id is protected, not just when its name is.
+protected="$(
+  for ref in "${IMAGE}-good" "${IMAGE}-prev" "${IMAGE}"; do
+    docker image inspect -f '{{.Id}}' "$ref" 2>/dev/null || true
+  done
+  for c in $(docker ps -q 2>/dev/null || true); do
+    docker inspect -f '{{.Image}}' "$c" 2>/dev/null || true
+  done
+)"
+repo_part="${IMAGE%:*}"; tag_part="${IMAGE##*:}"
+docker image ls "${repo_part}" --format '{{.Tag}}' \
+  | grep -E "^${tag_part}-[0-9a-f]{12}(-p[0-9a-f]{7})?\$" \
+  | awk -v keep="${KEEP_IMAGES}" 'NR > keep' \
+  | while read -r old; do
+      old_id="$(docker image inspect -f '{{.Id}}' "${repo_part}:${old}" 2>/dev/null || true)"
+      if [ -n "$old_id" ] && printf '%s\n' "$protected" | grep -qxF "$old_id"; then
+        echo "keeping ${repo_part}:${old} (rollback or in-use image)"
+        continue
+      fi
+      docker rmi "${repo_part}:${old}" >/dev/null 2>&1 || true
+    done || true
 
 echo "DEPLOY_OK ${SERVICE} image=${SHA_TAG}"
 REMOTE

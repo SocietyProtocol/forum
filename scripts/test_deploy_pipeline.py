@@ -411,5 +411,162 @@ class WorkflowInputHandlingTests(unittest.TestCase):
         self.assertNotIn("grep -Eq '^[0-9a-f]{40}$'", text)
 
 
+SHA_TAG = "%s-%s-p%s" % (IMAGE, SHA_A[:12], SHA_B[:7])
+GOOD = IMAGE + "-good"
+PREV = IMAGE + "-prev"
+
+
+class RollbackImageTests(BoxTestCase):
+    """-good moves only after a deploy proved itself; failures never touch -good/-prev."""
+
+    def seed_running_w(self):
+        # W is live and tagged -good, V is the release before it.
+        self.box.seed(
+            {IMAGE: "sha256:W", GOOD: "sha256:W", PREV: "sha256:V",
+             "%s-%s" % (IMAGE, "w" * 0 + "0123456789ab"): "sha256:W"},
+            running="sha256:W",
+        )
+
+    def deploy(self, new_id="sha256:X", **kw):
+        run_extra = {"STUB_NEW_ID": new_id}
+        run_extra.update(kw.pop("run_extra", {}))
+        return self.box.deploy(run_extra=run_extra, **kw)
+
+    def assertRollbackUntouched(self):
+        tags = self.box.tags()
+        self.assertEqual(tags[GOOD], "sha256:W")
+        self.assertEqual(tags[PREV], "sha256:V")
+        retags = [c for c in self.box.calls if c.startswith("docker tag ") and (GOOD in c or PREV in c)]
+        self.assertEqual(retags, [])
+
+    def test_healthy_deploy_promotes_new_image_to_good_and_old_good_to_prev(self):
+        self.seed_running_w()
+        p = self.deploy()
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        tags = self.box.tags()
+        self.assertEqual(tags[GOOD], "sha256:X")
+        self.assertEqual(tags[PREV], "sha256:W")
+        self.assertEqual(tags[IMAGE], "sha256:X")
+        self.assertEqual(tags[SHA_TAG], "sha256:X")
+        self.assertIn("DEPLOY_OK", p.stdout)
+
+    def test_good_moves_only_after_the_health_check(self):
+        self.seed_running_w()
+        self.deploy()
+        calls = self.box.calls
+        health = max(i for i, c in enumerate(calls) if " curl " in c)
+        promote = min(i for i, c in enumerate(calls) if c.startswith("docker tag ") and GOOD in c)
+        self.assertLess(health, promote)
+
+    def test_failed_health_check_leaves_good_and_prev_untouched_and_prints_rollback(self):
+        self.seed_running_w()
+        p = self.deploy(run_extra={"STUB_HEALTH": "bad"})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertRollbackUntouched()
+        self.assertIn("DEPLOY_FAILED", p.stderr)
+        self.assertIn("docker tag %s %s && " % (GOOD, IMAGE), p.stderr)
+        self.assertNotIn("DEPLOY_OK", p.stdout)
+
+    def test_failed_plugin_assertion_leaves_good_and_prev_untouched(self):
+        self.seed_running_w()
+        p = self.deploy(run_extra={"STUB_PLUGIN_SHA": "d" * 40, "STUB_LABEL_SHA": SHA_B})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertRollbackUntouched()
+
+    def test_failed_build_changes_no_tags(self):
+        self.seed_running_w()
+        before = self.box.tags()
+        p = self.deploy(run_extra={"STUB_BUILD_FAIL": "1"})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(self.box.tags(), before)
+
+    def test_failed_compose_up_leaves_good_and_prev_untouched(self):
+        self.seed_running_w()
+        p = self.deploy(run_extra={"STUB_COMPOSE_FAIL": "1"})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertRollbackUntouched()
+        self.assertIn("docker compose up failed", p.stderr)
+
+    def test_without_a_health_check_good_moves_after_compose_up_succeeds(self):
+        self.seed_running_w()
+        p = self.deploy(extra_env={"HEALTH_URL_PATH": "", "HEALTH_PLUGIN_DIR": ""})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.box.tags()[GOOD], "sha256:X")
+        self.assertEqual(self.box.tags()[PREV], "sha256:W")
+
+    def test_without_a_health_check_failed_compose_still_leaves_good_alone(self):
+        self.seed_running_w()
+        p = self.deploy(extra_env={"HEALTH_URL_PATH": "", "HEALTH_PLUGIN_DIR": ""},
+                        run_extra={"STUB_COMPOSE_FAIL": "1"})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertRollbackUntouched()
+
+    def test_a_failed_deploy_followed_by_a_good_one_keeps_the_last_good_release_as_prev(self):
+        # The reported bug: deploy N fails its health check with bad image X live;
+        # deploy N+1 then used to retag the broken X as -prev.
+        self.seed_running_w()
+        bad = self.deploy(new_id="sha256:X", run_extra={"STUB_HEALTH": "bad"})
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertEqual(self.box.tags()[IMAGE], "sha256:X")  # broken image is the live tag
+        ok = self.deploy(new_id="sha256:Y")
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        tags = self.box.tags()
+        self.assertEqual(tags[GOOD], "sha256:Y")
+        self.assertEqual(tags[PREV], "sha256:W")
+        self.assertNotIn("sha256:X", (tags[GOOD], tags[PREV]))
+
+    def test_failed_deploy_followed_by_failed_build_still_rolls_back_to_w(self):
+        self.seed_running_w()
+        self.deploy(new_id="sha256:X", run_extra={"STUB_HEALTH": "bad"})
+        p = self.deploy(run_extra={"STUB_BUILD_FAIL": "1"})
+        self.assertNotEqual(p.returncode, 0)
+        self.assertRollbackUntouched()
+        self.assertIn("docker build failed", p.stderr)
+        # the live tag still holds the broken X from deploy N, and -good is what to roll back to
+        self.assertEqual(self.box.tags()[IMAGE], "sha256:X")
+
+    def test_rerunning_the_good_build_does_not_make_prev_equal_good(self):
+        self.seed_running_w()
+        self.deploy(new_id="sha256:X")
+        again = self.deploy(new_id="sha256:X")
+        self.assertEqual(again.returncode, 0, again.stderr)
+        tags = self.box.tags()
+        self.assertEqual(tags[GOOD], "sha256:X")
+        self.assertEqual(tags[PREV], "sha256:W")
+
+    def test_first_deploy_without_good_creates_it_and_failure_names_the_fallback(self):
+        self.box.seed({}, running="")
+        bad = self.deploy(run_extra={"STUB_HEALTH": "bad"})
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertNotIn(GOOD, self.box.tags())
+        self.assertIn("No %s image exists" % GOOD, bad.stderr)
+        ok = self.deploy()
+        self.assertEqual(ok.returncode, 0, ok.stderr)
+        self.assertEqual(self.box.tags()[GOOD], "sha256:X")
+        self.assertNotIn(PREV, self.box.tags())
+
+    def test_pruning_never_removes_good_prev_or_in_use_images(self):
+        def t(i):
+            return "%s-%012x" % (IMAGE, i)
+
+        tags = {t(i): "sha256:old%d" % i for i in range(1, 9)}
+        # old2 is -good (becomes -prev on this deploy), old3 is the stale -prev,
+        # old5 backs some other running container.
+        tags.update({IMAGE: "sha256:old2", GOOD: "sha256:old2", PREV: "sha256:old3"})
+        self.box.seed(tags, running="sha256:old2")
+        p = self.deploy(extra_env={"KEEP_IMAGES": "2"}, run_extra={"STUB_EXTRA_RUNNING": "sha256:old5"})
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        removed = [c.split()[-1] for c in self.box.calls if c.startswith("docker rmi ")]
+        self.assertNotIn(t(2), removed)  # becomes -prev
+        self.assertNotIn(t(5), removed)  # in use
+        self.assertNotIn(t(8), removed)  # within KEEP_IMAGES
+        for gone in (1, 3, 4, 6, 7):  # unprotected and beyond KEEP_IMAGES
+            self.assertIn(t(gone), removed, gone)
+        final = self.box.tags()
+        self.assertEqual(final[GOOD], "sha256:X")
+        self.assertEqual(final[PREV], "sha256:old2")
+        self.assertEqual(final[t(5)], "sha256:old5")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
