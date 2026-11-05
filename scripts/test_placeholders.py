@@ -56,7 +56,7 @@ def main() -> int:
         raise SystemExit("Dockerfile must declare both SIWE_REF and SIWE_BRANCH")
     if "io.societyprotocol.siwe-auth.ref" not in dockerfile:
         raise SystemExit("Dockerfile does not label the plugin ref")
-    for name in (".env.example",):
+    for name in (".env.example", ".env.staging.example"):
         text = (ROOT / name).read_text(encoding="utf-8")
         for line in text.splitlines():
             if "://" in line and "@" in line.split("://", 1)[1].split("/", 1)[0]:
