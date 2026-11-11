@@ -38,7 +38,7 @@ permissions:
 
 jobs:
   prepare:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       target: ${{ steps.t.outputs.target }}
       checkout_ref: ${{ steps.t.outputs.checkout_ref }}
@@ -64,7 +64,7 @@ jobs:
 
   test:
     needs: prepare
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -111,7 +111,7 @@ jobs:
   deploy-staging:
     needs: [prepare, test]
     if: needs.prepare.outputs.target == 'staging'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
@@ -163,7 +163,7 @@ jobs:
   deploy-prod:
     needs: [prepare, test]
     if: needs.prepare.outputs.target == 'prod'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       id-token: write
