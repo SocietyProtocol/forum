@@ -5,6 +5,10 @@ and `society-forum:prod`, deployed by `.github/workflows/deploy-aws.yml`).
 Names below come from the repo and from earlier inspection of the AWS box. Items
 marked **verify** were not confirmed against the live box when this was written.
 
+The decided production configuration for the plugin release (badge to group mapping,
+group sync, gating, badge mirror, env vars, GitHub environments) is in
+[`docs/PRODUCTION_SETTINGS.md`](PRODUCTION_SETTINGS.md).
+
 ## 1. Who owns what
 
 | Area | Owner |
@@ -223,6 +227,8 @@ sending `X-Forwarded-Proto: https` or `DISCOURSE_HOSTNAME` is wrong (see `docs/S
   stored in the `site_settings` table. Keep them env-only.
 - Rule of thumb: env for endpoints, tokens and anything that differs per environment;
   admin UI for what Fritz tunes (group mapping, sync mode, statement, exempt list).
+  The values decided for production, and the env var names the prod forum needs, are
+  listed in [`docs/PRODUCTION_SETTINGS.md`](PRODUCTION_SETTINGS.md).
 - Dump a redacted baseline (run it on staging first; a `rails runner` needs more memory than the
   forum's container limit, so raise it temporarily and restore it: `docker update --memory 2g --memory-swap 4g <container>`):
 

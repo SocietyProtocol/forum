@@ -3,6 +3,13 @@
 **Decision needed from August and Ashton: Option A or Option B below.** Do not let a plain
 merge decide it.
 
+> Update: the settings to apply once the plugin ships are decided and listed in
+> [`docs/PRODUCTION_SETTINGS.md`](PRODUCTION_SETTINGS.md). The rewrite script described
+> under Option A has become the plugin's transfer tool (`rake siwe:smart_accounts:transfer`,
+> or the same script for a forum on an older plugin version); it takes its own backup
+> tables. Follow the plugin README section "Transferring users to smart accounts" for the
+> current commands; the hazard and the two options below still apply.
+
 ## The hazard
 
 The prod image builds `discourse-siwe-auth` from its `main` branch
