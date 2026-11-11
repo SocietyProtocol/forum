@@ -96,7 +96,9 @@ regard to case, so:
 - `siwe:groups:bootstrap` prints `governors: exists, left as is`. It does not create a
   second group and does not change the existing one's settings.
 - The sync uses that group as it is: it keeps its id, name, members, owners and
-  category permissions. Do not rename or recreate it.
+  category permissions. Do not rename or recreate it. (The gating plan compares
+  category permissions without regard to case since plugin commit `d4238c6`; before
+  it, a gated category of such a group was reported as drift on every run.)
 - Its two current members are judged like everyone else. Read them in the `log`
   report before enforcing: a member who does not hold badge 13 is removed after two
   runs unless they are staff, a group owner, or listed in
@@ -231,12 +233,52 @@ Not env vars, admin UI: `siwe_group_badge_mapping`, `siwe_group_sync_mode`,
 `siwe_badges_community_allowlist`, `siwe_badges_app_url`, `siwe_badges_disable_system`,
 `prioritize_username_in_ux`.
 
-## 10. Staging equivalents
+## 10. Staging equivalents, as applied
 
-Staging reads the Sepolia badges contract. The stand-ins: Governor is badge 69, Core
-Team is badge 70, so staging's mapping is `69:governors|70:core-team`; community
-badges 74, 75 and 76 are on staging's allowlist for testing. Everything else follows
-the sections above.
+Staging reads the Sepolia badges contract (`0x12406bB6d11Cb641e100F1d8595c0C5e63F0bD47`,
+chain 11155111). The stand-ins, read from the contract's `badges(id)`: badge 69 is
+"[Rehearsal] Governor", badge 70 is "[Rehearsal] Core Team"; neither is flagged
+official there, so the badge mirror on staging works from the community allowlist
+(74, 75, 76), which production leaves empty.
+
+Applied on 2026-11-11 with plugin commit `f7e8168` (version 1.9.0), through
+`SiteSetting.set_and_log`, so each value is editable in the admin UI and is in the
+staff action log:
+
+| Setting | Before | Now |
+| --- | --- | --- |
+| `siwe_group_badge_mapping` | empty | `69:governors\|70:core-team` |
+| `siwe_group_sync_mode` | `off` | `log`, then `enforce` |
+| `siwe_gating_config` | empty | the YAML of section 4 |
+| `siwe_badges_sync_mode` | `off` | `enforce` |
+| `prioritize_username_in_ux` | `true` | `false` |
+
+Unchanged on purpose: `siwe_badges_community_allowlist` (`74\|75\|76`),
+`siwe_badges_app_url` (empty), `siwe_badges_disable_system` (`false`; the built-in
+badges were already disabled on staging), the removal and revoke brakes (defaults).
+
+What that produced, and what was checked there:
+
+- `siwe:groups:bootstrap[false]` created `governors` and `core-team`, visible to
+  members, member list for staff only, closed. The `log` report and the first
+  `enforce` run agreed with `balanceOf` on chain: `governors` holds rehearsal_alice
+  and rehearsal_bob, `core-team` holds rehearsal_alice and rehearsal_carol (each holds
+  the badge on the Light Account). A second `enforce` run reported no changes.
+- `siwe:gating:provision[apply]` created the category `core-team-lounge` (core-team
+  full, staff full) and set the group's full name; a second `provision` printed
+  `nothing to change`; `siwe:gating:audit` printed `AUDIT CLEAN` before and after.
+  Anonymous requests for the category and both groups return 404.
+- A group spelled in another case (the production `Governors` case) was tried by
+  renaming `core-team` to `Core-Team` for one run: the gating plan stayed empty, the
+  sync and the audit found the group. It was renamed back.
+- `siwe:badges:sync[enforce]` twice: both runs `no changes` (badges 74, 75, 76 were
+  mirrored earlier).
+- The plugin's acceptance scripts passed with these settings in place:
+  `gating_acceptance.rb` 34 of 34, `badge_mirror_acceptance.rb` 47 of 47.
+- The user transfer (`rake siwe:smart_accounts:transfer`) was run against a test set
+  in this database: dry run, apply with two merges, second apply (nothing to write),
+  verify, the printed restore SQL through `rails dbconsole -p`, and an apply again.
+  The test users, groups, badges and backup tables were removed afterwards.
 
 ## 11. GitHub environments and the AWS role
 
