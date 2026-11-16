@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Test double for the aws CLI: "s3 cp s3://... <dest>" copies $STUB_TGZ to <dest>.
+echo "aws $*" >> "$STUB_STATE/calls.log"
+if [ "$1" = s3 ] && [ "$2" = cp ]; then cp "$STUB_TGZ" "$4"; exit 0; fi
+exit 0
