@@ -2,12 +2,13 @@
 """Tests for the deploy pipeline: .github/scripts/deploy-outpost.sh and the workflow.
 
 No AWS, no network, no docker. The remote script is generated with DRY_RUN=1 and then
-run against test doubles for docker, aws, flock and sleep (scripts/stubs).
+run against test doubles for docker, aws, flock, sleep and curl (scripts/stubs).
 
 Run: python3 scripts/test_deploy_pipeline.py
 Set FORUM_ROOT to run the same tests against another checkout of the repo.
 """
 
+import hashlib
 import os
 import re
 import shutil
@@ -144,7 +145,7 @@ class Box:
             # keep stubs for everything except flock: real flock must come first or be absent
             d = self.dir / "nolock"
             d.mkdir(exist_ok=True)
-            for name in ("docker", "aws", "sleep"):
+            for name in ("docker", "aws", "sleep", "curl"):
                 (d / name).symlink_to(STUBS / name)
         p = subprocess.run(
             ["bash", str(script)], env=run_env, capture_output=True, text=True, timeout=timeout
@@ -655,6 +656,242 @@ class PluginPinFileTests(BoxTestCase):
         self.assertNotEqual(bad.returncode, 0)
         self.assertIn("!= pinned " + SHA_C, bad.stderr)
         self.assertEqual(self.box.tags()[GOOD], "sha256:W")
+
+
+class PinRequiredTests(BoxTestCase):
+    """PIN_REQUIRED=1 (prod): no build unless .plugin-pin holds a SHA."""
+
+    def ctx(self, content):
+        d = Path(tempfile.mkdtemp(prefix="pinctx.", dir=self.box.dir))
+        if content is not None:
+            (d / ".plugin-pin").write_text(content)
+        return str(d)
+
+    def test_missing_or_blank_pin_file_refuses_before_anything_happens(self):
+        for content in (None, "", "  \n"):
+            for explicit in ("", SHA_B):
+                rc, out, err = dry_run(base_env(CONTEXT=self.ctx(content), PIN_SHA=explicit,
+                                                PIN_REQUIRED="1"))
+                label = "file %r, PIN_SHA %r" % (content, explicit)
+                self.assertNotEqual(rc, 0, label)
+                self.assertIn("PIN_REQUIRED", err, label)
+                self.assertIn(".plugin-pin", err, label)
+                self.assertNotIn("DRY_RUN", out, label)
+
+    def test_pin_file_satisfies_the_requirement(self):
+        script = remote_script(base_env(CONTEXT=self.ctx(SHA_C + "\n"), PIN_SHA="",
+                                        PIN_REQUIRED="1"))
+        self.assertIn("export PIN_SHA=" + SHA_C, script)
+
+    def test_explicit_sha_still_wins_for_one_run_when_the_file_is_there(self):
+        script = remote_script(base_env(CONTEXT=self.ctx(SHA_C), PIN_SHA=SHA_B, PIN_REQUIRED="1"))
+        self.assertIn("export PIN_SHA=" + SHA_B, script)
+
+    def test_malformed_file_fails_even_with_an_explicit_sha(self):
+        rc, _, err = dry_run(base_env(CONTEXT=self.ctx("main\n"), PIN_SHA=SHA_B))
+        self.assertNotEqual(rc, 0)
+        self.assertIn(".plugin-pin", err)
+
+    def test_pin_required_takes_only_1(self):
+        for value in ("yes", "true", "0", "1 "):
+            rc, _, _ = dry_run(base_env(CONTEXT=self.ctx(SHA_C), PIN_REQUIRED=value))
+            self.assertNotEqual(rc, 0, value)
+
+    def test_without_pin_required_a_missing_file_still_follows_the_tip(self):
+        script = remote_script(base_env(CONTEXT=self.ctx(None), PIN_SHA=SHA_B))
+        self.assertIn("export PIN_SHA=" + SHA_B, script)
+
+
+BUNDLE_URL = "https://forum.example.test/plugins/discourse-siwe-auth/javascripts/siwe.iife.js"
+BUNDLE_PATH = "/var/www/discourse/public/plugins/discourse-siwe-auth/javascripts/siwe.iife.js"
+VERSION_MODULE = (
+    "/var/www/discourse/plugins/discourse-siwe-auth/assets/javascripts/discourse/lib/"
+    "siwe-bundle-version.js"
+)
+CLEAN = b"(function(){console.log('wallets');})();\n"
+STUBBED = b'(function(){throw new Error(\'Could not resolve "@metamask/connect-evm"\')})();\n'
+
+
+class PublicBundleTests(BoxTestCase):
+    """The public bundle (through the CDN) must equal the file in the new image."""
+
+    def setUp(self):
+        super().setUp()
+        self.box.seed({IMAGE: "sha256:W", GOOD: "sha256:W", PREV: "sha256:V"}, running="sha256:W")
+
+    def file(self, name, data):
+        p = self.box.dir / name
+        p.write_bytes(data)
+        return str(p)
+
+    def module(self, version):
+        return self.file(
+            "siwe-bundle-version.js",
+            ("// Generated\nexport const SIWE_BUNDLE_VERSION = '%s'\n\n"
+             "export const SIWE_BUNDLE_URL = `/plugins/discourse-siwe-auth/javascripts/"
+             "siwe.iife.js?v=${SIWE_BUNDLE_VERSION}`\n" % version).encode(),
+        )
+
+    def deploy(self, image=CLEAN, public=CLEAN, module=None, extra_env=None, **run_extra):
+        env = {
+            "PUBLIC_BUNDLE_URL": BUNDLE_URL,
+            "PUBLIC_BUNDLE_IMAGE_PATH": BUNDLE_PATH,
+            "PUBLIC_BUNDLE_VERSION_MODULE": VERSION_MODULE,
+        }
+        env.update(extra_env or {})
+        run = {"STUB_NEW_ID": "sha256:X", "STUB_BUNDLE_FILE": self.file("image.js", image),
+               "STUB_PUBLIC_FILE": self.file("public.js", public)}
+        if module is not None:
+            run["STUB_VERSION_MODULE"] = module
+        run.update(run_extra)
+        return self.box.deploy(extra_env=env, run_extra=run)
+
+    def fetches(self):
+        return [c for c in self.box.calls if c.startswith("curl ") and c != "curl -V"]
+
+    def assertPromoted(self, p):
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertIn("public bundle matches the image", p.stdout)
+        self.assertEqual(self.box.tags()[GOOD], "sha256:X")
+
+    def assertFailedUnpromoted(self, p, text):
+        self.assertNotEqual(p.returncode, 0, p.stdout)
+        self.assertIn(text, p.stderr)
+        self.assertNotIn("DEPLOY_OK", p.stdout)
+        self.assertEqual(self.box.tags()[GOOD], "sha256:W")
+        self.assertEqual(self.box.tags()[PREV], "sha256:V")
+
+    def test_plain_url_is_fetched_like_a_browser_when_there_is_no_version_module(self):
+        p = self.deploy()
+        self.assertPromoted(p)
+        fetches = self.fetches()
+        self.assertEqual(len(fetches), 1, fetches)
+        self.assertTrue(fetches[0].endswith(" " + BUNDLE_URL), fetches[0])
+        for part in ("Mozilla/5.0", "Sec-Fetch-Dest: script", "Referer: https://forum.example.test/",
+                     "--compressed"):
+            self.assertIn(part, fetches[0])
+        self.assertIn("cf-cache-status: HIT", p.stdout)
+
+    def test_versioned_url_from_the_module_is_fetched(self):
+        version = hashlib.sha256(CLEAN).hexdigest()[:16]
+        p = self.deploy(module=self.module(version))
+        self.assertPromoted(p)
+        self.assertTrue(self.fetches()[0].endswith(" %s?v=%s" % (BUNDLE_URL, version)))
+
+    def test_stale_public_copy_fails_the_deploy_and_keeps_good(self):
+        p = self.deploy(public=b"// the old bundle\n")
+        self.assertFailedUnpromoted(p, "differs from " + BUNDLE_PATH)
+        self.assertIn(hashlib.sha256(CLEAN).hexdigest(), p.stderr)
+
+    def test_stub_in_the_public_copy_fails(self):
+        p = self.deploy(image=STUBBED.replace(b"Could not resolve", b"fine"), public=STUBBED)
+        self.assertFailedUnpromoted(p, "Could not resolve")
+
+    def test_stub_in_the_image_fails_even_when_the_public_copy_matches(self):
+        p = self.deploy(image=STUBBED, public=STUBBED)
+        self.assertFailedUnpromoted(p, "in the new image holds a 'Could not resolve' stub")
+        self.assertEqual(self.fetches(), [])
+
+    def test_optional_peer_dep_stub_also_fails(self):
+        stub = b"import '__vite-optional-peer-dep:@safe-global/safe-apps-sdk';\n"
+        p = self.deploy(image=stub, public=stub)
+        self.assertFailedUnpromoted(p, "stub")
+
+    def test_version_that_is_not_the_bundle_hash_fails(self):
+        p = self.deploy(module=self.module("0123456789abcdef"))
+        self.assertFailedUnpromoted(p, "is not a prefix of the sha256")
+        self.assertEqual(self.fetches(), [])
+
+    def test_module_without_a_version_fails(self):
+        p = self.deploy(module=self.file("siwe-bundle-version.js", b"export default 1\n"))
+        self.assertFailedUnpromoted(p, "no SIWE_BUNDLE_VERSION")
+
+    def test_missing_bundle_in_the_image_fails(self):
+        p = self.deploy(STUB_BUNDLE_FILE=str(self.box.dir / "nope.js"))
+        self.assertFailedUnpromoted(p, "could not read " + BUNDLE_PATH)
+
+    def test_a_transient_error_is_retried(self):
+        p = self.deploy(STUB_PUBLIC_STATUS="502,000,200")
+        self.assertPromoted(p)
+        self.assertEqual(len(self.fetches()), 3)
+
+    def test_a_persistent_error_fails_after_the_attempts(self):
+        p = self.deploy(extra_env={"PUBLIC_BUNDLE_ATTEMPTS": "2"}, STUB_PUBLIC_STATUS="502")
+        self.assertFailedUnpromoted(p, "answered HTTP 502 after 2 attempts")
+        self.assertEqual(len(self.fetches()), 2)
+
+    def test_a_curl_without_zlib_asks_for_the_plain_body(self):
+        p = self.deploy(STUB_CURL_LIBZ="0")
+        self.assertPromoted(p)
+        self.assertNotIn("--compressed", self.fetches()[0])
+
+    def test_check_runs_after_the_health_check_and_before_good_moves(self):
+        self.deploy()
+        calls = self.box.calls
+        health = max(i for i, c in enumerate(calls) if " curl " in c and c.startswith("docker "))
+        fetch = next(i for i, c in enumerate(calls) if c.startswith("curl ") and c != "curl -V")
+        promote = min(i for i, c in enumerate(calls) if c.startswith("docker tag ") and GOOD in c)
+        self.assertLess(health, fetch)
+        self.assertLess(fetch, promote)
+
+    def test_without_public_bundle_url_nothing_is_fetched(self):
+        p = self.box.deploy(run_extra={"STUB_NEW_ID": "sha256:X"})
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual([c for c in self.box.calls if c.startswith("curl ")], [])
+
+    def test_bad_settings_are_rejected_before_anything_is_built(self):
+        ok = dict(PUBLIC_BUNDLE_URL=BUNDLE_URL, PUBLIC_BUNDLE_IMAGE_PATH=BUNDLE_PATH)
+        for label, kw in (
+            ("http", dict(ok, PUBLIC_BUNDLE_URL=BUNDLE_URL.replace("https:", "http:"))),
+            ("query string", dict(ok, PUBLIC_BUNDLE_URL=BUNDLE_URL + "?v=1")),
+            ("quote", dict(ok, PUBLIC_BUNDLE_URL=BUNDLE_URL + "'")),
+            ("space", dict(ok, PUBLIC_BUNDLE_URL=BUNDLE_URL + " -o x")),
+            ("credentials", dict(ok, PUBLIC_BUNDLE_URL="https://u:p@forum.example.test/a.js")),
+            ("no image path", dict(ok, PUBLIC_BUNDLE_IMAGE_PATH="")),
+            ("relative image path", dict(ok, PUBLIC_BUNDLE_IMAGE_PATH="siwe.iife.js")),
+            ("module path with space", dict(ok, PUBLIC_BUNDLE_VERSION_MODULE="/a b.js")),
+            ("no health check", dict(ok, HEALTH_URL_PATH="")),
+            ("zero attempts", dict(ok, PUBLIC_BUNDLE_ATTEMPTS="0")),
+            ("attempts not a number", dict(ok, PUBLIC_BUNDLE_ATTEMPTS="x")),
+        ):
+            rc, out, _ = dry_run(base_env(**kw))
+            self.assertNotEqual(rc, 0, label)
+            self.assertNotIn("DRY_RUN", out, label)
+
+
+class ForumPinAndBundleWiringTests(unittest.TestCase):
+    """The forum workflow wires the pin rule and the public bundle check per environment."""
+
+    def env_of(self, job):
+        _, jobs = workflow_jobs()
+        return dict(re.findall(r"^\s+([A-Z_]+): (.+?)\s*$", jobs[job], re.M))
+
+    def test_committed_pin_file_is_one_valid_sha(self):
+        text = (ROOT / ".plugin-pin").read_text()
+        self.assertRegex(text, r"\A[0-9a-f]{40}\n?\Z")
+
+    def test_prod_requires_the_pin_file_and_staging_does_not(self):
+        self.assertEqual(self.env_of("deploy-prod").get("PIN_REQUIRED"), '"1"')
+        self.assertNotIn("PIN_REQUIRED", self.env_of("deploy-staging"))
+        self.assertIn("needs.prepare.outputs.target == 'prod'", self.env_of("test").get("PIN_REQUIRED", ""))
+
+    def test_both_deploys_check_their_public_bundle_against_the_image(self):
+        dockerfile = DOCKERFILE.read_text()
+        for job, host in (("deploy-staging", "staging-forum.societyprotocol.io"),
+                          ("deploy-prod", "forum.societyprotocol.io")):
+            env = self.env_of(job)
+            self.assertEqual(env["PUBLIC_BUNDLE_URL"],
+                             "https://%s/plugins/discourse-siwe-auth/javascripts/siwe.iife.js" % host)
+            # the file the Dockerfile copies to the public path is the one compared
+            self.assertIn(env["PUBLIC_BUNDLE_IMAGE_PATH"], dockerfile)
+            self.assertTrue(env["PUBLIC_BUNDLE_VERSION_MODULE"].startswith(env["HEALTH_PLUGIN_DIR"] + "/"))
+            self.assertTrue(env["PUBLIC_BUNDLE_VERSION_MODULE"].endswith("/siwe-bundle-version.js"))
+            # and the settings pass the script's own validation
+            rc, out, err = dry_run(base_env(
+                PUBLIC_BUNDLE_URL=env["PUBLIC_BUNDLE_URL"],
+                PUBLIC_BUNDLE_IMAGE_PATH=env["PUBLIC_BUNDLE_IMAGE_PATH"],
+                PUBLIC_BUNDLE_VERSION_MODULE=env["PUBLIC_BUNDLE_VERSION_MODULE"]))
+            self.assertEqual(rc, 0, job + ": " + err)
 
 
 def workflow_jobs():

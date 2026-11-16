@@ -25,7 +25,7 @@ on:
         required: true
         default: staging
       plugin_sha:
-        description: "Optional 40-char discourse-siwe-auth commit for THIS run only (default: .plugin-pin, else branch tip)"
+        description: "Optional 40-char discourse-siwe-auth commit for THIS run only (default: .plugin-pin; staging falls back to the branch tip, prod requires the file)"
         type: string
         required: false
   repository_dispatch:
@@ -91,7 +91,7 @@ jobs:
           DRY_RUN: "1"
         run: bash .github/scripts/deploy-outpost.sh > /dev/null
 
-      - name: .plugin-pin is a valid SHA (when set)
+      - name: .plugin-pin is a valid SHA (required for prod)
         env:
           IMAGE: society-forum:test
           SERVICE: test-forum
@@ -99,13 +99,16 @@ jobs:
           GITHUB_REPOSITORY: ${{ github.repository }}
           PIN_REPO_URL: https://example.invalid/plugin.git
           PIN_BUILD_ARG: SIWE_REF
+          # Same rule as deploy-prod below, checked here so a missing pin fails before
+          # the deploy job starts.
+          PIN_REQUIRED: ${{ needs.prepare.outputs.target == 'prod' && '1' || '' }}
           DRY_RUN: "1"
         run: |
           # PIN_SHA is deliberately unset so the file is what gets validated.
-          if [ -f .plugin-pin ] && [ -n "$(tr -d ' \t\r\n' < .plugin-pin)" ]; then
+          if [ -n "$PIN_REQUIRED" ] || { [ -f .plugin-pin ] && [ -n "$(tr -d ' \t\r\n' < .plugin-pin)" ]; }; then
             bash .github/scripts/deploy-outpost.sh | grep '^pinned '
           else
-            echo "no .plugin-pin: deploys follow the plugin branch tip"
+            echo "no .plugin-pin: staging deploys follow the plugin branch tip"
           fi
 
   deploy-staging:
@@ -156,6 +159,13 @@ jobs:
           HEALTH_URL_PATH: /srv/status
           HEALTH_EXPECT_BODY: ok
           HEALTH_PLUGIN_DIR: /var/www/discourse/plugins/discourse-siwe-auth
+          # After the health check, fetch the wallet bundle from the public host (through
+          # Cloudflare, with browser headers, at the ?v= URL the page loads when the plugin
+          # has siwe-bundle-version.js) and fail unless it is byte-identical to the file in
+          # the new image and holds no "Could not resolve" stub (docs/UPGRADE.md section 6).
+          PUBLIC_BUNDLE_URL: https://staging-forum.societyprotocol.io/plugins/discourse-siwe-auth/javascripts/siwe.iife.js
+          PUBLIC_BUNDLE_IMAGE_PATH: /var/www/discourse/public/plugins/discourse-siwe-auth/javascripts/siwe.iife.js
+          PUBLIC_BUNDLE_VERSION_MODULE: /var/www/discourse/plugins/discourse-siwe-auth/assets/javascripts/discourse/lib/siwe-bundle-version.js
           # Opt-in migration hook, see docs/UPGRADE.md before enabling:
           # POST_DEPLOY_CMD: cd /var/www/discourse && su discourse -c 'bundle exec rake db:migrate'
         run: bash .github/scripts/deploy-outpost.sh
@@ -204,10 +214,20 @@ jobs:
           PIN_BRANCH: main
           PIN_BUILD_ARG: SIWE_REF
           PIN_SHA: ${{ needs.prepare.outputs.plugin_sha }}
+          # Prod never builds the plugin branch tip: without a SHA in .plugin-pin the
+          # deploy stops before uploading or building anything.
+          PIN_REQUIRED: "1"
           HEALTH_CONTAINER: society-prod-forum-1
           HEALTH_URL_PATH: /srv/status
           HEALTH_EXPECT_BODY: ok
           HEALTH_PLUGIN_DIR: /var/www/discourse/plugins/discourse-siwe-auth
+          # After the health check, fetch the wallet bundle from the public host (through
+          # Cloudflare, with browser headers, at the ?v= URL the page loads when the plugin
+          # has siwe-bundle-version.js) and fail unless it is byte-identical to the file in
+          # the new image and holds no "Could not resolve" stub (docs/UPGRADE.md section 6).
+          PUBLIC_BUNDLE_URL: https://forum.societyprotocol.io/plugins/discourse-siwe-auth/javascripts/siwe.iife.js
+          PUBLIC_BUNDLE_IMAGE_PATH: /var/www/discourse/public/plugins/discourse-siwe-auth/javascripts/siwe.iife.js
+          PUBLIC_BUNDLE_VERSION_MODULE: /var/www/discourse/plugins/discourse-siwe-auth/assets/javascripts/discourse/lib/siwe-bundle-version.js
           # Opt-in migration hook, see docs/UPGRADE.md before enabling:
           # POST_DEPLOY_CMD: cd /var/www/discourse && su discourse -c 'bundle exec rake db:migrate'
         run: bash .github/scripts/deploy-outpost.sh

@@ -23,6 +23,10 @@ by itself, but it triggers a prod build that resolves whatever plugin `main` is 
 
 The deploy pipeline does not read this file. Until the choice is made, do not merge the plugin's
 `staging` into its `main`, and do not wire a `repository_dispatch` with `env: prod` from the plugin repo.
+Once prod requires `.plugin-pin` (see the warning under Option B), a plugin `main` change only
+reaches prod through a forum PR that moves the pin, which is the place to make this decision, or
+through a hand-run deploy of `main` with an explicit `plugin_sha` (one run only, and it still needs
+the `production` approval).
 
 ## Option A: rewrite users first, then ship the plugin to prod
 
@@ -92,11 +96,27 @@ Merge the Light Account work later, following Option A at that time.
 > root of forum `main`: one full 40-char lowercase SHA, nothing else. While the file is non-empty,
 > every deploy of that branch (push, `workflow_dispatch`, `repository_dispatch`) builds exactly that
 > plugin commit and the post-deploy check asserts it; a `plugin_sha` given explicitly to a run still
-> wins for that run. The file is per branch: `staging` has its own, and merging `staging` into
-> `main` carries a staging `.plugin-pin` over, so look at it in every PR. A `plugin-updated`
-> dispatch without a `sha` also follows the file, not the new plugin tip, until the file is
-> updated or emptied (delete the line, or the file, to follow the branch tip again). A malformed
-> file fails the deploy instead of falling back to the tip.
+> wins for that run. A `plugin-updated` dispatch without a `sha` also follows the file, not the new
+> plugin tip. A malformed file fails the deploy instead of falling back to the tip.
+>
+> **Prod requires `.plugin-pin` from the moment the workflow change that adds `PIN_REQUIRED`
+> lands on `main`.** A push to `main` runs the workflow file of the pushed commit, so the merge
+> that brings the change is itself the first prod deploy under the rule; dispatches run the file
+> on `main` and check out `main`, so they follow it from then on too. Every prod run (push,
+> `workflow_dispatch`, `repository_dispatch`) then needs a valid SHA in `main`'s `.plugin-pin`,
+> even when `plugin_sha` is given (it still picks the commit for that run, but does not replace
+> the file). A missing, empty or whitespace-only file fails the `test` job, before the deploy
+> job starts and before anything is uploaded or built, so prod can no longer pick up the plugin
+> `main` tip by accident. The merge commit therefore must already contain the pin: set `main`'s
+> `.plugin-pin` in an earlier PR or in the same PR, to the plugin commit live on prod today
+> (plugin `main`, `c74c0ae784f2421585ff223e0e2a6ad6838ab084` at the time of writing; check the
+> image label `io.societyprotocol.siwe-auth.ref` or the build log first).
+>
+> **`staging` has its own `.plugin-pin`, and a merge carries it to `main`.** Staging pins a
+> plugin `staging` commit, which contains the Light Account login. Merging forum `staging` into
+> `main` without changing that line would make prod build it, which is exactly the hazard above.
+> Every staging-to-main PR must set `.plugin-pin` to the commit chosen under Option A or B, and
+> the reviewer checks that line.
 Check how the cherry-picked sync code resolves `S` versus `E` before choosing this: the plan (F2/F3) says
 the new features need Light Account addresses.
 
