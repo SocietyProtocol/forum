@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Test double for the host curl used by the public bundle check in deploy-outpost.sh.
+
+Every call is logged to $STUB_STATE/calls.log as "curl <args>".
+Knobs (env): STUB_PUBLIC_FILE (body served for any URL), STUB_PUBLIC_STATUS (comma
+separated HTTP codes, one per call, the last one repeats; default 200),
+STUB_PUBLIC_HEADERS (extra header lines), STUB_CURL_LIBZ=0 (a curl without zlib).
+"""
+import os
+import sys
+
+S = os.environ["STUB_STATE"]
+args = sys.argv[1:]
+with open(os.path.join(S, "calls.log"), "a") as f:
+    f.write("curl " + " ".join(args) + "\n")
+
+if args == ["-V"]:
+    feats = "AsynchDNS HTTPS SSL" + ("" if os.environ.get("STUB_CURL_LIBZ") == "0" else " libz")
+    print("curl 8.0.0-stub\nFeatures: " + feats)
+    sys.exit(0)
+
+if "--compressed" in args and os.environ.get("STUB_CURL_LIBZ") == "0":
+    sys.stderr.write("curl: option --compressed: the installed libcurl version doesn't support this\n")
+    sys.exit(2)
+
+
+def flagval(flag):
+    return args[args.index(flag) + 1] if flag in args else None
+
+
+counter = os.path.join(S, "curl.count")
+n = int(open(counter).read()) if os.path.exists(counter) else 0
+open(counter, "w").write(str(n + 1))
+codes = (os.environ.get("STUB_PUBLIC_STATUS") or "200").split(",")
+code = codes[min(n, len(codes) - 1)]
+
+out, hdr = flagval("-o"), flagval("-D")
+body = b""
+if code == "200":
+    src = os.environ.get("STUB_PUBLIC_FILE")
+    body = open(src, "rb").read() if src else b""
+elif code == "000":
+    sys.stderr.write("curl: (6) Could not resolve host\n")
+    sys.stdout.write("000")
+    sys.exit(6)
+if out:
+    open(out, "wb").write(body)
+if hdr:
+    lines = ["HTTP/2 " + code, "cache-control: public, max-age=31536000, immutable", "cf-cache-status: HIT"]
+    extra = os.environ.get("STUB_PUBLIC_HEADERS")
+    if extra:
+        lines.extend(extra.split("\n"))
+    open(hdr, "w").write("\r\n".join(lines) + "\r\n\r\n")
+if "-w" in args:
+    sys.stdout.write(code)

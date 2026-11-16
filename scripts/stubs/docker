@@ -3,7 +3,10 @@
 
 State lives in $STUB_STATE/state.json (image tags -> ids, what is running).
 Knobs (env): STUB_NEW_ID, STUB_BUILD_FAIL, STUB_COMPOSE_FAIL, STUB_HEALTH (ok|bad),
-STUB_IMAGE (the tag compose runs), STUB_PLUGIN_SHA, STUB_LABEL_SHA.
+STUB_IMAGE (the tag compose runs), STUB_PLUGIN_SHA, STUB_LABEL_SHA,
+STUB_BUNDLE_FILE (host file served by `docker exec <c> cat <bundle path>`),
+STUB_VERSION_MODULE (host file served for a path ending in siwe-bundle-version.js;
+unset means that module does not exist in the container).
 """
 import json
 import os
@@ -100,6 +103,17 @@ elif cmd == "exec":
         if os.environ.get("STUB_HEALTH", "ok") != "ok":
             sys.exit(22)
         print("ok")
+    elif " test -f " in joined:
+        sys.exit(0 if args[-1].endswith("siwe-bundle-version.js") and os.environ.get("STUB_VERSION_MODULE") else 1)
+    elif " cat " in joined:
+        if args[-1].endswith("siwe-bundle-version.js"):
+            src = os.environ.get("STUB_VERSION_MODULE")
+        else:
+            src = os.environ.get("STUB_BUNDLE_FILE")
+        if not src or not os.path.exists(src):
+            sys.stderr.write("cat: %s: No such file or directory\n" % args[-1])
+            sys.exit(1)
+        sys.stdout.buffer.write(open(src, "rb").read())
     elif " grep " in joined:
         print("# version: 0.0.0-test")
     elif "rev-parse" in joined:

@@ -20,8 +20,12 @@
 #                                       value (one full SHA, surrounding whitespace
 #                                       ignored), that SHA is used instead of the branch
 #                                       tip. This is what makes a pin survive later
-#                                       pushes; PIN_SHA still wins over the file.
-#   HEALTH_URL_PATH                     enable the post-deploy check, e.g. /srv/status
+#                                       pushes; PIN_SHA still wins over the file. A
+#                                       malformed file fails the deploy either way.
+#   PIN_REQUIRED=1                      refuse to deploy (before any upload or build)
+#                                       unless PIN_FILE holds a valid SHA. Set for prod,
+#                                       so it never builds whatever the branch tip is.
+#   HEALTH_URL_PATH                    enable the post-deploy check, e.g. /srv/status
 #   HEALTH_CONTAINER                    default society-${SERVICE}-1
 #   HEALTH_PORT                         default 80 (port inside the container)
 #   HEALTH_EXPECT_BODY                  exact response body expected, e.g. ok
@@ -30,6 +34,25 @@
 #                                       its HEAD must equal the pinned SHA and its
 #                                       plugin.rb "# version:" line is printed
 #   EXPECT_PLUGIN_VERSION               optional exact "# version:" value to assert
+#   PUBLIC_BUNDLE_URL                   public https URL of a static file, without a
+#                                       query string, e.g. https://<host>/plugins/x/a.js.
+#                                       After the health check the box fetches it the way
+#                                       a browser does (through the CDN, browser headers)
+#                                       and fails the deploy unless its sha256 equals the
+#                                       file at PUBLIC_BUNDLE_IMAGE_PATH in the new
+#                                       container, or if either copy holds a bundler
+#                                       'Could not resolve "<pkg>"' stub. Needs
+#                                       HEALTH_URL_PATH.
+#   PUBLIC_BUNDLE_IMAGE_PATH            path of that file inside the container
+#                                       (required with PUBLIC_BUNDLE_URL)
+#   PUBLIC_BUNDLE_VERSION_MODULE        optional path inside the container of a JS module
+#                                       with SIWE_BUNDLE_VERSION = '<hex>' (the plugin's
+#                                       siwe-bundle-version.js). When it exists, the URL
+#                                       fetched is PUBLIC_BUNDLE_URL?v=<hex>, the URL the
+#                                       page loads, and <hex> must prefix the file's sha256.
+#                                       When it does not exist the plain URL is fetched.
+#   PUBLIC_BUNDLE_ATTEMPTS              fetches before giving up on a non-200 (default 6,
+#                                       10s apart). A wrong body is not retried.
 #   POST_DEPLOY_CMD                     shell command run with `docker exec` in the new
 #                                       container before the health wait, for example
 #                                       a database migration. Not set by default.
@@ -64,6 +87,11 @@ PIN_BRANCH="${PIN_BRANCH:-main}"
 PIN_BUILD_ARG="${PIN_BUILD_ARG:-}"
 PIN_SHA="${PIN_SHA:-}"
 PIN_FILE="${PIN_FILE:-${CONTEXT}/.plugin-pin}"
+PIN_REQUIRED="${PIN_REQUIRED:-}"
+PUBLIC_BUNDLE_URL="${PUBLIC_BUNDLE_URL:-}"
+PUBLIC_BUNDLE_IMAGE_PATH="${PUBLIC_BUNDLE_IMAGE_PATH:-}"
+PUBLIC_BUNDLE_VERSION_MODULE="${PUBLIC_BUNDLE_VERSION_MODULE:-}"
+PUBLIC_BUNDLE_ATTEMPTS="${PUBLIC_BUNDLE_ATTEMPTS:-6}"
 HEALTH_URL_PATH="${HEALTH_URL_PATH:-}"
 HEALTH_CONTAINER="${HEALTH_CONTAINER:-society-${SERVICE}-1}"
 HEALTH_PORT="${HEALTH_PORT:-80}"
@@ -81,9 +109,35 @@ DRY_RUN="${DRY_RUN:-}"
 DEPLOY_SHA="${DEPLOY_SHA:-$GITHUB_SHA}"
 
 case "$IMAGE" in *:*) ;; *) IMAGE="${IMAGE}:latest" ;; esac
-case "$HEALTH_TIMEOUT_SECONDS$HEALTH_PORT$KEEP_IMAGES$LOCK_TIMEOUT_SECONDS" in
-  *[!0-9]*) echo "HEALTH_TIMEOUT_SECONDS, HEALTH_PORT, KEEP_IMAGES and LOCK_TIMEOUT_SECONDS must be integers" >&2; exit 2 ;;
+case "$HEALTH_TIMEOUT_SECONDS$HEALTH_PORT$KEEP_IMAGES$LOCK_TIMEOUT_SECONDS$PUBLIC_BUNDLE_ATTEMPTS" in
+  *[!0-9]*) echo "HEALTH_TIMEOUT_SECONDS, HEALTH_PORT, KEEP_IMAGES, LOCK_TIMEOUT_SECONDS and PUBLIC_BUNDLE_ATTEMPTS must be integers" >&2; exit 2 ;;
 esac
+case "$PIN_REQUIRED" in
+  ""|1) ;;
+  *) echo "PIN_REQUIRED must be empty or 1" >&2; exit 2 ;;
+esac
+if [ -n "$PUBLIC_BUNDLE_URL" ]; then
+  # One plain https URL: no query string (the version is added from the module), no
+  # credentials, no whitespace or quotes.
+  case "$PUBLIC_BUNDLE_URL" in
+    https://*) ;;
+    *) echo "PUBLIC_BUNDLE_URL must start with https://" >&2; exit 2 ;;
+  esac
+  case "$PUBLIC_BUNDLE_URL" in
+    *[!A-Za-z0-9._~/:-]*) echo "PUBLIC_BUNDLE_URL may only hold host and path characters (no query string)" >&2; exit 2 ;;
+  esac
+  for p in "$PUBLIC_BUNDLE_IMAGE_PATH" "$PUBLIC_BUNDLE_VERSION_MODULE"; do
+    case "$p" in
+      *[!A-Za-z0-9._/-]*) echo "PUBLIC_BUNDLE_IMAGE_PATH and PUBLIC_BUNDLE_VERSION_MODULE must be plain absolute paths" >&2; exit 2 ;;
+    esac
+  done
+  case "$PUBLIC_BUNDLE_IMAGE_PATH" in
+    /*) ;;
+    *) echo "PUBLIC_BUNDLE_IMAGE_PATH must be set to an absolute path with PUBLIC_BUNDLE_URL" >&2; exit 2 ;;
+  esac
+  [ -n "$HEALTH_URL_PATH" ] || { echo "PUBLIC_BUNDLE_URL needs HEALTH_URL_PATH (the check runs after the health check)" >&2; exit 2; }
+  [ "$PUBLIC_BUNDLE_ATTEMPTS" -ge 1 ] || { echo "PUBLIC_BUNDLE_ATTEMPTS must be at least 1" >&2; exit 2; }
+fi
 
 # A full lowercase commit SHA, judged by length and charset. A line-anchored grep
 # regex would accept "<40 hex>\nmore" because grep matches line by line.
@@ -106,7 +160,8 @@ if [ -n "$PIN_REPO_URL" ]; then
     ""|[0-9]*|*[!A-Za-z0-9_]*) echo "PIN_BUILD_ARG must be a plain identifier" >&2; exit 2 ;;
   esac
   PIN_SOURCE="explicit PIN_SHA"
-  if [ -z "$PIN_SHA" ] && [ -f "$PIN_FILE" ]; then
+  pin_text=""
+  if [ -f "$PIN_FILE" ]; then
     pin_text="$(cat "$PIN_FILE")"
     # trim leading and trailing whitespace (including CR) but keep inner newlines,
     # so a multi-line file is rejected by the SHA check below instead of merged
@@ -114,9 +169,15 @@ if [ -n "$PIN_REPO_URL" ]; then
     pin_text="${pin_text#"${pin_text%%[![:space:]]*}"}"
     if [ -n "$pin_text" ]; then
       is_sha40 "$pin_text" || { echo "${PIN_FILE} must contain exactly one 40-char lowercase commit SHA (or be empty to follow the branch tip)" >&2; exit 1; }
-      PIN_SHA="$pin_text"
-      PIN_SOURCE="${PIN_FILE}"
     fi
+  fi
+  if [ -n "$PIN_REQUIRED" ] && [ -z "$pin_text" ]; then
+    echo "PIN_REQUIRED: ${PIN_FILE} is missing or empty. This environment never builds the tip of ${PIN_BRANCH}; commit the plugin SHA to deploy to .plugin-pin first." >&2
+    exit 1
+  fi
+  if [ -z "$PIN_SHA" ] && [ -n "$pin_text" ]; then
+    PIN_SHA="$pin_text"
+    PIN_SOURCE="${PIN_FILE}"
   fi
   if [ -z "$PIN_SHA" ]; then
     PIN_SOURCE="tip of ${PIN_BRANCH}"
@@ -147,6 +208,7 @@ trap 'rm -rf "$WORKDIR"' EXIT
   for var in BUCKET PREFIX ENVFILE BUILD_ARGS IMAGE SHA_TAG SERVICE PIN_SHA \
     HEALTH_URL_PATH HEALTH_CONTAINER HEALTH_PORT HEALTH_EXPECT_BODY \
     HEALTH_TIMEOUT_SECONDS HEALTH_PLUGIN_DIR EXPECT_PLUGIN_VERSION \
+    PUBLIC_BUNDLE_URL PUBLIC_BUNDLE_IMAGE_PATH PUBLIC_BUNDLE_VERSION_MODULE PUBLIC_BUNDLE_ATTEMPTS \
     POST_DEPLOY_CMD KEEP_IMAGES LOCK_FILE LOCK_TIMEOUT_SECONDS COMPOSE_DIR REMOTE_TMP; do
     printf 'export %s=%q\n' "$var" "${!var}"
   done
@@ -260,6 +322,85 @@ if [ -n "${HEALTH_URL_PATH}" ]; then
         || fail_with_logs "image label '${label_sha}' != pinned ${PIN_SHA}"
     fi
   fi
+fi
+
+# The public copy of a static file, fetched the way a browser gets it: from the
+# public host (so through the CDN), with browser headers, at the URL the page loads.
+# Discourse serves /plugins/ files as immutable for a year, so a CDN copy of an
+# older file at the same URL never refreshes, and the health check above (inside
+# the container) cannot see that.
+if [ -n "${PUBLIC_BUNDLE_URL}" ]; then
+  sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -c1-64
+  }
+  # Throwing stubs a bundler leaves for a missing optional dependency; they build
+  # with exit code 0 and only fail when someone clicks that wallet.
+  stub_count() { grep -c -F -e 'Could not resolve "' -e '__vite-optional-peer-dep' "$1" || true; }
+  image_copy="${RUN_DIR}/image-bundle"
+  public_copy="${RUN_DIR}/public-bundle"
+  public_headers="${RUN_DIR}/public-headers"
+
+  docker exec "${HEALTH_CONTAINER}" cat "${PUBLIC_BUNDLE_IMAGE_PATH}" > "$image_copy" \
+    || fail_with_logs "could not read ${PUBLIC_BUNDLE_IMAGE_PATH} in ${HEALTH_CONTAINER}"
+  [ -s "$image_copy" ] || fail_with_logs "${PUBLIC_BUNDLE_IMAGE_PATH} is empty in ${HEALTH_CONTAINER}"
+  image_sha="$(sha256_of "$image_copy")"
+  [ "$(stub_count "$image_copy")" = 0 ] \
+    || fail_with_logs "${PUBLIC_BUNDLE_IMAGE_PATH} in the new image holds a 'Could not resolve' stub: a wallet SDK was missing when the bundle was built"
+
+  fetch_url="${PUBLIC_BUNDLE_URL}"
+  if [ -n "${PUBLIC_BUNDLE_VERSION_MODULE}" ] \
+    && docker exec "${HEALTH_CONTAINER}" test -f "${PUBLIC_BUNDLE_VERSION_MODULE}"; then
+    bundle_version="$(docker exec "${HEALTH_CONTAINER}" cat "${PUBLIC_BUNDLE_VERSION_MODULE}" \
+      | sed -n "s/.*SIWE_BUNDLE_VERSION *= *[\"']\([0-9a-f][0-9a-f]*\)[\"'].*/\1/p" | head -n 1)"
+    [ -n "$bundle_version" ] \
+      || fail_with_logs "no SIWE_BUNDLE_VERSION = '<hex>' in ${PUBLIC_BUNDLE_VERSION_MODULE}"
+    case "$image_sha" in
+      "${bundle_version}"*) ;;
+      *) fail_with_logs "SIWE_BUNDLE_VERSION ${bundle_version} is not a prefix of the sha256 of ${PUBLIC_BUNDLE_IMAGE_PATH} (${image_sha}): the page would load a versioned URL for different content" ;;
+    esac
+    fetch_url="${PUBLIC_BUNDLE_URL}?v=${bundle_version}"
+  fi
+
+  command -v curl >/dev/null 2>&1 || fail_with_logs "curl is required on the box for the public bundle check"
+  origin="$(printf '%s' "${PUBLIC_BUNDLE_URL}" | sed -E 's#^(https://[^/]+).*#\1#')"
+  # Browsers ask for a compressed body; a minimal curl without zlib cannot decode one,
+  # so it asks for the plain body instead (the CDN serves the same cached object).
+  compressed=""
+  if curl -V 2>/dev/null | grep -qw libz; then compressed="--compressed"; fi
+  attempt=0
+  status=""
+  while [ "$attempt" -lt "${PUBLIC_BUNDLE_ATTEMPTS}" ]; do
+    attempt=$((attempt + 1))
+    # Checked from the box on 2026-11-16 against staging: Cloudflare answered HTTP/2 200
+    # with the bundle (no cf-mitigated challenge) both to these headers and to a bare
+    # curl, versioned and plain URL. If a bot rule ever challenges it, the status is
+    # not 200 and the deploy fails here with that status.
+    # shellcheck disable=SC2086
+    status="$(curl -sS ${compressed} --max-time 60 -o "$public_copy" -D "$public_headers" -w '%{http_code}' \
+      -A 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36' \
+      -H 'Accept: */*' -H "Referer: ${origin}/" \
+      -H 'Sec-Fetch-Dest: script' -H 'Sec-Fetch-Mode: no-cors' -H 'Sec-Fetch-Site: same-origin' \
+      "$fetch_url" 2>/dev/null || true)"
+    if [ "$status" = 200 ]; then
+      break
+    fi
+    echo "public fetch ${attempt}/${PUBLIC_BUNDLE_ATTEMPTS} of ${fetch_url}: HTTP ${status:-error}"
+    if [ "$attempt" -lt "${PUBLIC_BUNDLE_ATTEMPTS}" ]; then
+      sleep 10
+    fi
+  done
+  [ "$status" = 200 ] \
+    || fail_with_logs "public ${fetch_url} answered HTTP ${status:-error} after ${PUBLIC_BUNDLE_ATTEMPTS} attempts"
+  [ -s "$public_copy" ] || fail_with_logs "public ${fetch_url} answered 200 with an empty body"
+  public_sha="$(sha256_of "$public_copy")"
+  cache_info="$(grep -i -E '^(cf-cache-status|age|cache-control):' "$public_headers" | tr -d '\r' | tr '\n' ' ' || true)"
+  echo "public ${fetch_url}: sha256 ${public_sha} (${cache_info:-no cache headers})"
+  echo "image ${PUBLIC_BUNDLE_IMAGE_PATH}: sha256 ${image_sha}"
+  [ "$(stub_count "$public_copy")" = 0 ] \
+    || fail_with_logs "public ${fetch_url} holds a 'Could not resolve' stub: browsers get a broken bundle. Purge that URL from the CDN cache, then re-run."
+  [ "$public_sha" = "$image_sha" ] \
+    || fail_with_logs "public ${fetch_url} (sha256 ${public_sha}) differs from ${PUBLIC_BUNDLE_IMAGE_PATH} in the new image (sha256 ${image_sha}). Browsers get the public copy, so the new bundle does not reach them. Purge that URL from the CDN cache (or ship the bundle under a new ?v= version), then re-run."
+  echo "public bundle matches the image"
 fi
 
 # The new container passed every configured check (or compose up succeeded when

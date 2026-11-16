@@ -119,10 +119,22 @@ push now really ships once a deploy runs. A plugin push alone does not start a d
 dispatch `sha` (that run only), the SHA in `.plugin-pin` at the root of the deployed branch (see
 below), the tip of the plugin branch. `plugin_sha` alone is **one-shot**: the next push to
 the branch re-resolves the tip. To hold a plugin commit across pushes, commit it to `.plugin-pin`
-(one full lowercase SHA, nothing else; empty or absent means follow the tip). The test job
-checks the file's format, and the post-deploy check asserts the container runs that commit. The file is per
-branch and rides along when `staging` is merged into `main`. `docs/RELEASE_SEQUENCING.md`
-explains why this matters for Option B.
+(one full lowercase SHA, nothing else). The test job checks the file's format, a malformed file
+fails the deploy even when `plugin_sha` is given, and the post-deploy check asserts the container
+runs that commit.
+
+- **Staging** has `.plugin-pin` committed (the plugin `staging` commit it runs). Empty
+  or absent would mean "follow the tip of plugin `staging`"; that is how staging picked up a
+  broken wallet bundle, so keep the file and move it on purpose: a plugin change ships to staging
+  by a forum PR that updates `.plugin-pin`.
+- **Prod refuses to build without it.** The `deploy-prod` job sets `PIN_REQUIRED=1`, and the test
+  job applies the same rule for prod runs: with `.plugin-pin` missing or empty on `main` the run
+  fails before anything is uploaded or built, also when `plugin_sha` is given. Prod never builds
+  the tip of plugin `main`.
+- **The file rides along when `staging` is merged into `main`.** Staging's pin is a plugin
+  `staging` commit, which may hold work that must not reach prod yet (see
+  `docs/RELEASE_SEQUENCING.md`). Every staging-to-main PR must set `.plugin-pin` on `main` to the
+  plugin commit approved for prod, and the reviewer checks that line of the diff.
 
 Dispatch inputs are untrusted text. `.github/scripts/prepare-target.sh` accepts only
 `ref` exactly `main` or `staging`, `env` exactly `staging` or `prod`, and a plugin SHA of
@@ -145,6 +157,32 @@ plugin checkout in the container (`git rev-parse HEAD`) and the image label
 `# version:` line of `plugin.rb`. On any failure the job exits non-zero and prints the last 50 log lines
 (credentials masked) plus the exact rollback command, which restores `society-forum:<env>-good`. Other services opt in by setting
 `HEALTH_URL_PATH`; without it the script behaves as before.
+
+**Public wallet bundle check.** The check above runs inside the container, so it cannot see
+what browsers get. Discourse serves `/plugins/discourse-siwe-auth/javascripts/siwe.iife.js`
+with `cache-control: public, max-age=31536000, immutable` and Cloudflare caches it, so an older
+copy at the same URL keeps being served after a deploy. After the health check the box
+therefore fetches the bundle from the public host (`PUBLIC_BUNDLE_URL`, through Cloudflare,
+with browser headers), at the URL the page loads:
+
+- when the plugin has `assets/javascripts/discourse/lib/siwe-bundle-version.js` (plugin
+  `staging` does, `main` does not yet), `siwe.iife.js?v=<SIWE_BUNDLE_VERSION>`. The version must
+  be the start of the bundle's sha256, or the deploy fails;
+- otherwise the plain URL, the one the older plugin loads.
+
+The deploy fails, and `-good` does not move, when the public copy's sha256 differs from
+`/var/www/discourse/public/plugins/discourse-siwe-auth/javascripts/siwe.iife.js` in the new
+container, or when either copy holds a `Could not resolve "<pkg>"` (or
+`__vite-optional-peer-dep`) stub. Only a non-200 answer is retried (`PUBLIC_BUNDLE_ATTEMPTS`,
+default 6, 10 s apart); a wrong body is not, because a cached copy does not change by waiting.
+The output shows both sha256 values and the `cf-cache-status` / `age` headers.
+
+When it fails on a mismatch, the new container is already serving and the rollback command
+does not help (the stale copy is at the CDN, not in the image). Purge
+`/plugins/discourse-siwe-auth/*` for that host in Cloudflare (owner), then re-run the deploy. A
+plugin that loads the versioned URL avoids this for new bundles. Do not fetch a new `?v=` URL by
+hand before the deploy that ships it: the old container would answer it with the old bundle
+and Cloudflare would keep that answer under the new URL.
 
 ## 7. Rollback
 
